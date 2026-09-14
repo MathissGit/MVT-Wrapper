@@ -1,0 +1,7 @@
+{
+  "type": "bundle",
+  "id": "bundle--test",
+  "objects": [
+    {"type":"indicator","spec_version":"2.1","name":"Test IOC","pattern":"[domain-name:value = 'evil.example.com']","valid_from":"2026-01-01T00:00:00Z"}
+  ]
+}
