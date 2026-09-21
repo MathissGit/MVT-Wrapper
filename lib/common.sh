@@ -439,20 +439,68 @@ json_summary() {
   python3 - "$1" <<'PY'
 import json, sys
 
-def deep_get(d, key):
+def pick(d, keys):
     if isinstance(d, dict):
-        if key in d and d[key] not in (None, ""):
-            return d[key]
+        for k in keys:
+            if k in d and d[k] not in (None, ""):
+                return d[k]
         for v in d.values():
-            r = deep_get(v, key)
+            r = pick(v, keys)
             if r not in (None, ""):
                 return r
     elif isinstance(d, list):
         for v in d:
-            r = deep_get(v, key)
+            r = pick(v, keys)
             if r not in (None, ""):
                 return r
     return None
+
+PRIO = ["name", "title", "entry", "value", "package", "uid",
+        "artistName", "bundleShortVersionString", "bundleVersion",
+        "installer", "system", "third_party", "disabled", "sourceURL",
+        "url", "path", "key", "label", "serial", "imei", "model", "version"]
+
+def evfmt(ev):
+    if not isinstance(ev, dict):
+        return ""
+    seen = set()
+    parts = []
+    def add(k, v):
+        if k in seen or k in ("message", "matched_indicator"):
+            return
+        seen.add(k)
+        if isinstance(v, dict):
+            sub = evfmt(v)
+            if sub:
+                parts.append(f"{k}: {{{sub}}}")
+            return
+        if isinstance(v, list):
+            if v:
+                joined = ", ".join(str(x) for x in v[:5])
+                if len(v) > 5:
+                    joined += ", ..."
+                if len(joined) < 160:
+                    parts.append(f"{k}: [{joined}]")
+            return
+        if isinstance(v, bool):
+            s = "oui" if v else "non"
+        elif v in (None, ""):
+            return
+        else:
+            s = str(v)
+        if len(s) > 140:
+            s = s[:137] + "..."
+        parts.append(f"{k}: {s}")
+    for k in PRIO:
+        if k in ev:
+            add(k, ev[k])
+    for k in ev:
+        if k not in PRIO:
+            add(k, ev[k])
+    return " ; ".join(parts[:10])
+
+LEVELS = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
+MAX = 100
 
 path = sys.argv[1]
 try:
@@ -465,17 +513,38 @@ if not isinstance(data, list) or not data:
     print("    (aucun enregistrement)")
     sys.exit(0)
 print(f"    {len(data)} enregistrement(s) correspondant à un IoC :")
-for rec in data[:50]:
-    ioc = deep_get(rec, "value") or deep_get(rec, "indicator") or deep_get(rec, "matched_indicator_value") or "n/a"
-    typ = deep_get(rec, "indicator_type") or "n/a"
-    sev = deep_get(rec, "severity") or "n/a"
-    art = deep_get(rec, "artifact") or deep_get(rec, "description") or "n/a"
-    if isinstance(art, dict):
-        art = json.dumps(art)[:160]
-    print(f"    - IoC: {ioc}   [{typ}]   sévérité: {sev}")
-    print(f"      artefact: {str(art)[:170]}")
-if len(data) > 50:
-    print(f"    (… {len(data)-50} autre(s) enregistrement(s) - détail dans {path})")
+for n, rec in enumerate(data[:MAX], 1):
+    if not isinstance(rec, dict):
+        continue
+    sev = str(pick(rec, ("level", "severity")) or "n/a").upper()
+    if sev not in LEVELS:
+        sev = "n/a"
+    msg = str(pick(rec, ("message", "description", "artifact")) or "n/a")
+    ioc_line = ""
+    ioc = rec.get("matched_indicator")
+    if isinstance(ioc, dict):
+        v = ioc.get("value") or "n/a"
+        t = ioc.get("type") or ""
+        c = ioc.get("name") or ioc.get("stix2_file_name") or ""
+        ioc_line = f"        IoC : {v}"
+        if t:
+            ioc_line += f"  (type: {t})"
+        if c:
+            ioc_line += f"  [collection: {c}]"
+    elif isinstance(ioc, str) and ioc:
+        ioc_line = f"        IoC : {ioc}"
+    else:
+        v = pick(rec, ("value", "indicator", "matched_indicator_value"))
+        if v not in (None, ""):
+            ioc_line = f"        IoC : {str(v)[:160]}"
+    ctx = evfmt(rec.get("event"))
+    print(f"    {n}) [{sev}] {msg[:220]}")
+    if ioc_line:
+        print(ioc_line)
+    if ctx:
+        print(f"        Détails : {ctx}")
+if len(data) > MAX:
+    print(f"    (... {len(data) - MAX} autre(s) enregistrement(s) - détail complet dans {path})")
 PY
 }
 
@@ -522,6 +591,22 @@ declare -A MODULE_DESC=(
   [whatsapp_contacts]="Contacts WhatsApp (ContactsV2.sqlite)."
   [sysdiagnose_info]="Infos device depuis le sysdiagnose (UDID, IMEI, serial, compte Apple)."
   [urls]="URLs extraites des SMS/iMessage/WhatsApp (déjà résolues si raccourcies)."
+  [aqf_get_prop]="Propriétés système Android (build/getprop) ; IoCs sur versions/patch/marque."
+  [aqf_packages]="Applications installées Android ; signale les apps non-système (adb/APK)."
+  [aqf_settings]="Réglages Android (settings) ; IoCs sur valeurs anormales."
+  [aqf_files]="Arborescence des fichiers Android ; IoCs sur chemins/noms suspects."
+  [aqf_log_timestamps]="Horodatages des journaux de l'appareil."
+  [dbinfo]="Métadonnées de l'acquisition AndroidQF (base, version, taille)."
+  [dumpsys_accessibility]="Services d'accessibilité actifs (marqués spyware via Accessibility)."
+  [dumpsys_get_prop]="Propriétés build/getprop via dumpsys ; IoCs sur versions/patch."
+  [dumpsys_battery_daily]="Historique batterie journalier ; IoCs sur pics anormaux."
+  [dumpsys_battery_history]="Historique détaillé de la charge batterie."
+  [dumpsys_packages]="Détails des packages installés ; IoCs sur signataires/autorisations."
+  [dumpsys_activities]="État de l'activité système / tâches récentes."
+  [dumpsys_appops]="Journal des autorisations (appops) accordées par application."
+  [dumpsys_receivers]="Récepteurs broadcast enregistrés par les apps."
+  [settings]="Réglages Android globaux/sécurisés (settings get)."
+  [mounts]="Points de montage du système de fichiers."
 )
 
 module_desc() {
@@ -623,13 +708,14 @@ extract_device_details() {
   local dir="$1"; shift
   local extra_args=("$@")
   python3 - "$dir" "${extra_args[@]}" <<'PY'
-import json, os, re, sys
+import base64, json, os, re, sys
 root = sys.argv[1]
 overrides = {}
 for a in sys.argv[2:]:
     if "=" in a:
         k, v = a.split("=", 1)
         overrides[k] = v
+
 def dig(d, keys):
     if isinstance(d, dict):
         for k in keys:
@@ -650,114 +736,231 @@ def fmt_storage(val):
     if val is None:
         return None
     try:
-        n = int(val)
+        n = int(str(val).split()[0])
         if n > 1_000_000_000_000:
             return f"{n / 1_000_000_000_000:.0f} To"
-        elif n > 1_000_000_000:
+        if n > 1_000_000_000:
             return f"{n / 1_000_000_000:.0f} Go"
-        elif n > 1_000_000:
+        if n > 1_000_000:
             return f"{n / 1_000_000:.0f} Mo"
         return str(n)
-    except (ValueError, TypeError):
-        return str(val)
+    except (ValueError, TypeError, IndexError):
+        return str(val)[:40]
 
-result = {
-    "IMEI":               overrides.get("IMEI"),
-    "Numero de serie":    overrides.get("Serial"),
-    "Marque":             overrides.get("Brand"),
-    "Modele":             overrides.get("Model"),
-    "Capacite stockage":  overrides.get("Storage"),
-    "Systeme d exploitation": overrides.get("OS"),
+def b64name(v):
+    try:
+        s = base64.b64decode(v).decode("utf-8", "ignore")
+        return s if s.isprintable() else None
+    except Exception:
+        return None
+
+APPLE_MODELS = {
+    "iPhone1,1": "iPhone (1re)", "iPhone1,2": "iPhone 3G", "iPhone2,1": "iPhone 3GS",
+    "iPhone3,1": "iPhone 4", "iPhone3,3": "iPhone 4 (CDMA)",
+    "iPhone4,1": "iPhone 4s", "iPhone5,1": "iPhone 5", "iPhone5,2": "iPhone 5",
+    "iPhone5,3": "iPhone 5c", "iPhone5,4": "iPhone 5c",
+    "iPhone6,1": "iPhone 5s", "iPhone6,2": "iPhone 5s",
+    "iPhone7,1": "iPhone 6 Plus", "iPhone7,2": "iPhone 6",
+    "iPhone8,1": "iPhone 6s", "iPhone8,2": "iPhone 6s Plus", "iPhone8,4": "iPhone SE (1re gen.)",
+    "iPhone9,1": "iPhone 7", "iPhone9,2": "iPhone 7 Plus",
+    "iPhone9,3": "iPhone 7", "iPhone9,4": "iPhone 7 Plus",
+    "iPhone10,1": "iPhone 8", "iPhone10,2": "iPhone 8 Plus", "iPhone10,3": "iPhone X",
+    "iPhone10,4": "iPhone 8", "iPhone10,5": "iPhone 8 Plus", "iPhone10,6": "iPhone X",
+    "iPhone11,2": "iPhone XS", "iPhone11,4": "iPhone XS Max",
+    "iPhone11,6": "iPhone XS Max", "iPhone11,8": "iPhone XR",
+    "iPhone12,1": "iPhone 11", "iPhone12,3": "iPhone 11 Pro", "iPhone12,5": "iPhone 11 Pro Max",
+    "iPhone13,1": "iPhone 12 mini", "iPhone13,2": "iPhone 12",
+    "iPhone13,3": "iPhone 12 Pro", "iPhone13,4": "iPhone 12 Pro Max",
+    "iPhone14,2": "iPhone 13 Pro", "iPhone14,3": "iPhone 13 Pro Max",
+    "iPhone14,4": "iPhone 13 mini", "iPhone14,5": "iPhone 13",
+    "iPhone14,7": "iPhone 14", "iPhone14,8": "iPhone 14 Plus",
+    "iPhone15,2": "iPhone 14 Pro", "iPhone15,3": "iPhone 14 Pro Max",
+    "iPhone15,4": "iPhone 15", "iPhone15,5": "iPhone 15 Plus",
+    "iPhone16,1": "iPhone 15 Pro", "iPhone16,2": "iPhone 15 Pro Max",
+    "iPhone17,1": "iPhone 16 Pro", "iPhone17,2": "iPhone 16 Pro Max",
+    "iPhone17,3": "iPhone 16", "iPhone17,4": "iPhone 16 Plus", "iPhone17,5": "iPhone 16e",
+    "iPad1,1": "iPad", "iPad2,5": "iPad mini", "iPad2,7": "iPad mini",
+    "iPad4,1": "iPad Air", "iPad4,4": "iPad mini 2", "iPad4,7": "iPad mini 3",
+    "iPad5,1": "iPad mini 4", "iPad5,2": "iPad mini 4",
+    "iPad5,3": "iPad Air 2", "iPad5,4": "iPad Air 2",
+    "iPad6,7": "iPad Pro (12,9\")", "iPad6,8": "iPad Pro (12,9\")",
+    "iPad6,11": "iPad (5e gen.)", "iPad6,12": "iPad (5e gen.)",
+    "iPad7,1": "iPad Pro (12,9\")", "iPad7,2": "iPad Pro (12,9\")",
+    "iPad7,5": "iPad (6e gen.)", "iPad7,6": "iPad (6e gen.)",
+    "iPad11,1": "iPad mini (5e gen.)", "iPad11,2": "iPad mini (5e gen.)",
+    "iPad11,6": "iPad (8e gen.)", "iPad11,7": "iPad (8e gen.)",
+    "iPad13,1": "iPad Air (4e gen.)", "iPad13,2": "iPad Air (4e gen.)",
+    "iPad13,16": "iPad Air (5e gen.)", "iPad13,17": "iPad Air (5e gen.)",
+    "iPad14,1": "iPad mini (6e gen.)", "iPad14,2": "iPad mini (6e gen.)",
+    "iPod5,1": "iPod touch (5e gen.)", "iPod7,1": "iPod touch (6e gen.)",
+    "iPod9,1": "iPod touch (7e gen.)",
+}
+SAMSUNG_MODELS = {
+    "SM-J710F": "Galaxy J7 (2016)", "SM-J710FN": "Galaxy J7 (2016)", "SM-J710MN": "Galaxy J7 (2016)",
+    "SM-J730F": "Galaxy J7 (2017)", "SM-J530F": "Galaxy J5 (2017)", "SM-J600F": "Galaxy J6",
+    "SM-A515F": "Galaxy A51", "SM-A525F": "Galaxy A52", "SM-A325F": "Galaxy A32",
+    "SM-A217F": "Galaxy A21s", "SM-A217M": "Galaxy A21s",
+    "SM-G950F": "Galaxy S8", "SM-G955F": "Galaxy S8+",
+    "SM-G960F": "Galaxy S9", "SM-G965F": "Galaxy S9+",
+    "SM-G970F": "Galaxy S10e", "SM-G973F": "Galaxy S10", "SM-G975F": "Galaxy S10+",
+    "SM-G975U": "Galaxy S10+", "SM-G970U": "Galaxy S10e",
+    "SM-G991B": "Galaxy S21", "SM-G996B": "Galaxy S21+", "SM-G998B": "Galaxy S21 Ultra",
+    "SM-S901B": "Galaxy S22", "SM-S906B": "Galaxy S22+", "SM-S908B": "Galaxy S22 Ultra",
+    "SM-S911B": "Galaxy S23", "SM-S916B": "Galaxy S23 Ultra",
+    "SM-N975F": "Galaxy Note 10+", "SM-N970F": "Galaxy Note 10",
+    "SM-T510": "Galaxy Tab A (10.1)", "SM-T515": "Galaxy Tab A (10.1)",
 }
 
-# Try to fill from files if not overridden
-if not result["IMEI"] or not result["Numero de serie"] or not result["Modele"]:
-    for name in ("backup_info.json", "sysdiagnose_info.json"):
-        p = os.path.join(root, name)
-        if os.path.isfile(p):
-            try:
-                d = json.load(open(p, encoding="utf-8"))
-                if not result["Modele"]:
-                    v = dig(d, ("product_type", "product", "devicemodel", "model"))
-                    if v: result["Modele"] = v
-                if not result["Systeme d exploitation"]:
-                    v = dig(d, ("product_version", "ios_version", "version"))
-                    if v: result["Systeme d exploitation"] = v
-                if not result["IMEI"]:
-                    v = dig(d, ("imei",))
-                    if v: result["IMEI"] = v
-                if not result["Numero de serie"]:
-                    v = dig(d, ("serial_number", "serialNumber", "SerialNumber"))
-                    if v: result["Numero de serie"] = v
-                if not result["Marque"]:
-                    result["Marque"] = "Apple"
-            except Exception:
-                pass
-            if any(result[k] for k in result):
-                break
-    if not any(result[k] for k in ("Modele", "IMEI", "Numero de serie")):
-        p = os.path.join(root, "acquisition.json")
-        if os.path.isfile(p):
-            try:
-                d = json.load(open(p, encoding="utf-8"))
-                if not result["Modele"]:
-                    v = dig(d, ("product_model", "model", "device_model"))
-                    if v: result["Modele"] = v
-                if not result["Systeme d exploitation"]:
-                    v = dig(d, ("device_version", "android_version", "version", "os_version"))
-                    if v: result["Systeme d exploitation"] = v
-                if not result["Marque"]:
-                    v = dig(d, ("product_manufacturer", "manufacturer", "brand"))
-                    if v: result["Marque"] = v
-                if not result["IMEI"]:
-                    v = dig(d, ("imei", "imei1", "Imei"))
-                    if v: result["IMEI"] = v
-                if not result["Numero de serie"]:
-                    v = dig(d, ("serial_number", "serial", "Serial"))
-                    if not v:
-                        adb = dig(d, ("collector", "Adb"))
-                        if isinstance(adb, dict):
-                            v = adb.get("Serial")
-                    if v: result["Numero de serie"] = v
-            except Exception:
-                pass
-    if not any(result[k] for k in ("Modele", "IMEI", "Numero de serie")):
-        p = os.path.join(root, "getprop.txt")
-        if os.path.isfile(p):
-            try:
-                txt = open(p, encoding="utf-8", errors="ignore").read()
-                mapping = {
-                    "ro.product.model": "Modele",
-                    "ro.build.version.release": "Systeme d exploitation",
-                    "ro.product.manufacturer": "Marque",
-                    "ro.ril.oem.imei": "IMEI",
-                    "ro.serialno": "Numero de serie",
-                }
-                for key, field in mapping.items():
-                    if not result[field]:
-                        m = re.search(r'\[' + re.escape(key) + r'\]:\s*\[([^\]]*)\]', txt)
-                        if m and m.group(1):
-                            result[field] = m.group(1)
-            except Exception:
-                pass
+def human_model(code, brand):
+    if not code:
+        return None
+    c = str(code).split("/")[0].strip()
+    if c in APPLE_MODELS:
+        return APPLE_MODELS[c] if c.lower().startswith("iphone") else APPLE_MODELS[c]
+    if c in SAMSUNG_MODELS:
+        return SAMSUNG_MODELS[c]
+    if c.upper().startswith("SM-"):
+        return "Galaxy " + c[3:]
+    return None
 
-# Storage from getprop if not overridden
-if not result["Capacite stockage"]:
-    p = os.path.join(root, "getprop.txt")
+# ordre d'affichage dans le rapport
+ORDER = ["Nom de l'appareil", "Marque", "Modele", "Systeme d exploitation",
+         "Build", "Dernier patch de securite", "Numero de telephone", "IMEI",
+         "Numero de serie", "ICCID", "MEID", "Target identifier",
+         "Derniere sauvegarde", "Applications installees", "Capacite stockage"]
+
+result = {k: (overrides.get({
+    "Nom de l'appareil": "DeviceName", "Marque": "Brand", "Modele": "Model",
+    "Systeme d exploitation": "OS", "Build": "Build", "IMEI": "IMEI",
+    "Numero de serie": "Serial", "Capacite stockage": "Storage",
+    "Numero de telephone": "Phone",
+}.get(k, "")) or None) for k in ORDER}
+
+model_code = overrides.get("ModelCode") or None
+platform = overrides.get("Platform")
+
+# --- Sources iOS (clés PascalCase) ---
+for name in ("backup_info.json", "sysdiagnose_info.json"):
+    p = os.path.join(root, name)
+    if not os.path.isfile(p):
+        continue
+    try:
+        d = json.load(open(p, encoding="utf-8"))
+    except Exception:
+        continue
+    platform = "iOS"
+    model_code = model_code or dig(d, ("Product Type", "product_type", "ProductType", "model"))
+    ver = dig(d, ("Product Version", "product_version", "ProductVersion", "ios_version"))
+    build = dig(d, ("Build Version", "build_version", "BuildVersion"))
+    if ver:
+        result["Systeme d exploitation"] = result["Systeme d exploitation"] or ("iOS " + str(ver))
+    result["Build"] = result["Build"] or build
+    result["Nom de l'appareil"] = result["Nom de l'appareil"] or \
+        b64name(dig(d, ("Display Name",)) or "") or dig(d, ("Device Name", "device_name", "name", "Devicename"))
+    result["Numero de telephone"] = result["Numero de telephone"] or \
+        dig(d, ("Phone Number", "phone_number", "PhoneNumber"))
+    result["IMEI"] = result["IMEI"] or dig(d, ("IMEI", "imei"))
+    result["Numero de serie"] = result["Numero de serie"] or \
+        dig(d, ("Serial Number", "serial_number", "SerialNumber", "Serial"))
+    result["ICCID"] = result["ICCID"] or dig(d, ("ICCID", "iccid"))
+    result["MEID"] = result["MEID"] or dig(d, ("MEID", "meid"))
+    result["Target identifier"] = result["Target identifier"] or \
+        dig(d, ("Target Identifier", "target_identifier", "Unique Identifier", "unique_identifier"))
+    result["Derniere sauvegarde"] = result["Derniere sauvegarde"] or \
+        dig(d, ("Last Backup Date", "last_backup_date", "LastBackupDate"))
+    apps = dig(d, ("Installed Applications", "installed_applications"))
+    if isinstance(apps, list) and apps:
+        result["Applications installees"] = result["Applications installees"] or f"{len(apps)} application(s)"
+    result["Marque"] = result["Marque"] or "Apple"
+    break
+
+# --- Source Android : acquisition.json ---
+if platform != "iOS":
+    p = os.path.join(root, "acquisition.json")
     if os.path.isfile(p):
         try:
-            txt = open(p, encoding="utf-8", errors="ignore").read()
+            d = json.load(open(p, encoding="utf-8"))
+        except Exception:
+            d = {}
+        platform = "Android"
+        model_code = model_code or dig(d, ("product_model", "model", "device_model"))
+        ver = dig(d, ("device_version", "android_version", "version", "os_version"))
+        if ver:
+            result["Systeme d exploitation"] = result["Systeme d exploitation"] or ("Android " + str(ver))
+        result["Marque"] = result["Marque"] or \
+            dig(d, ("product_manufacturer", "manufacturer", "brand"))
+        result["IMEI"] = result["IMEI"] or dig(d, ("imei", "imei1", "Imei"))
+        serial = result["Numero de serie"] or dig(d, ("serial_number", "serial", "Serial"))
+        if not serial:
+            adb = dig(d, ("collector", "Adb"))
+            if isinstance(adb, dict):
+                serial = adb.get("Serial")
+        result["Numero de serie"] = result["Numero de serie"] or serial
+
+# --- Source Android : getprop.txt ---
+p = os.path.join(root, "getprop.txt")
+if os.path.isfile(p):
+    try:
+        txt = open(p, encoding="utf-8", errors="ignore").read()
+        gmap = {
+            "ro.product.model": "Modele",
+            "ro.product.manufacturer": "Marque",
+            "ro.build.version.short": "Build",
+            "ro.build.version.incremental": "Build",
+            "ro.build.display.id": "Build",
+            "ro.build.version.security_patch": "Dernier patch de securite",
+            "ro.ril.oem.imei": "IMEI",
+            "ro.serialno": "Numero de serie",
+        }
+        release = None
+        mrel = re.search(r'\[ro\.build\.version\.release\]:\s*\[([^\]]*)\]', txt)
+        if mrel:
+            release = mrel.group(1)
+        if release:
+            result["Systeme d exploitation"] = result["Systeme d exploitation"] or ("Android " + release)
+        for key, field in gmap.items():
+            if result[field]:
+                continue
+            m = re.search(r'\[' + re.escape(key) + r'\]:\s*\[([^\]]*)\]', txt)
+            if m and m.group(1):
+                result[field] = m.group(1)
+        if not result["Capacite stockage"]:
             for key in ("ro.product.disk.size", "ro.emmc.size"):
                 m = re.search(r'\[' + re.escape(key) + r'\]:\s*\[([^\]]*)\]', txt)
                 if m and m.group(1):
                     result["Capacite stockage"] = fmt_storage(m.group(1))
                     break
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-for field in ("IMEI", "Numero de serie", "Marque", "Modele", "Capacite stockage", "Systeme d exploitation"):
-    val = result.get(field) or "non disponible"
-    print(f"{field}: {val}")
+# --- Compteur d'applications Android ---
+if not result["Applications installees"]:
+    for name in ("aqf_packages.json", "dumpsys_packages.json"):
+        ap = os.path.join(root, name)
+        if os.path.isfile(ap):
+            try:
+                alist = json.load(open(ap, encoding="utf-8"))
+                if isinstance(alist, list):
+                    n = len([x for x in alist if isinstance(x, dict) and x.get("name")])
+                    if n:
+                        result["Applications installees"] = f"{n} application(s)"
+                        break
+            except Exception:
+                pass
+
+# --- Modele humain + codé ---
+if not result["Modele"] and model_code:
+    human = human_model(model_code, result["Marque"])
+    result["Modele"] = f"{human} ({model_code})" if human else str(model_code)
+elif result["Modele"]:
+    human = human_model(result["Modele"], result["Marque"])
+    if human and human != str(result["Modele"]):
+        result["Modele"] = f"{human} ({result['Modele']})"
+
+for field in ORDER:
+    val = result[field]
+    if val not in (None, "", "non disponible"):
+        print(f"{field}: {str(val)[:170]}")
 PY
 }
 
@@ -766,6 +969,107 @@ PY
 # ------------------------------------------------------------------
 collect_detected() {
   find "$1" -maxdepth 1 -type f -name '*_detected.json' 2>/dev/null | LC_ALL=C sort
+}
+
+# Statistiques agrégées sur tous les *_detected.json du dossier.
+# Sortie TSV : total|<n> | level|<SEV>|<n> | module|<mod>|<nb>|<niveau max>
+detection_stats() {
+  python3 - "$1" <<'PY'
+import json, os, sys
+from collections import defaultdict
+root = sys.argv[1]
+order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+try:
+    files = sorted(f for f in os.listdir(root)
+                   if f.endswith("_detected.json") and os.path.isfile(os.path.join(root, f)))
+except OSError:
+    sys.exit(0)
+tot, bylev, bymod = 0, defaultdict(int), {}
+for fn in files:
+    try:
+        data = json.load(open(os.path.join(root, fn), encoding="utf-8"))
+    except Exception:
+        continue
+    if not isinstance(data, list):
+        continue
+    mod = fn.replace("_detected.json", "")
+    for rec in data:
+        if not isinstance(rec, dict):
+            continue
+        lev = str((rec.get("level") or rec.get("severity") or "")).upper()
+        if lev not in order:
+            lev = "INFO"
+        tot += 1
+        bylev[lev] += 1
+        if mod not in bymod:
+            bymod[mod] = [0, ""]
+        bymod[mod][0] += 1
+        if not bymod[mod][1] or order[lev] > order[bymod[mod][1]]:
+            bymod[mod][1] = lev
+print(f"total|{tot}")
+for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+    print(f"level|{k}|{bylev.get(k, 0)}")
+for mod, (c, mx) in sorted(bymod.items()):
+    print(f"module|{mod}|{c}|{mx}")
+PY
+}
+
+# Bloc de synthèse (ligne de verdict) inséré en tête du rapport.
+# $1 = dossier d'analyse
+detection_synthesis() {
+  local results="$1"
+  local tot=0 c_crit=0 c_high=0 c_med=0 c_low=0 c_info=0 mods=0
+  local t a b verdict
+  while IFS='|' read -r t a b; do
+    case "$t" in
+      total) tot="$a" ;;
+      level) case "$a" in
+               CRITICAL) c_crit="$b" ;;
+               HIGH)     c_high="$b" ;;
+               MEDIUM)   c_med="$b" ;;
+               LOW)      c_low="$b" ;;
+               INFO)     c_info="$b" ;;
+             esac ;;
+      module) mods=$((mods + 1)) ;;
+    esac
+  done < <(detection_stats "$results")
+
+  if [ "$tot" -le 0 ]; then
+    verdict="AUCUNE détection d'IoC - preuve a priori saine (à confirmer)."
+  elif [ "$c_crit" -gt 0 ]; then
+    verdict="CRITIQUE - indicateurs de niveau maximal détectés : compromission hautement probable, investigation immédiate requise."
+  elif [ "$c_high" -gt 0 ]; then
+    verdict="ELEVE - indicateurs de niveau élevé détectés : investigation prioritaire recommandée."
+  elif [ "$c_med" -gt 0 ]; then
+    verdict="MOYEN - indicateurs de niveau moyen détectés : à investiguer et corroborer."
+  else
+    verdict="FAIBLE/INFO - seuls des indicateurs de niveau faible ou informatifs ont été relevés (à surveiller)."
+  fi
+
+  echo '--------------------------------------------------------------'
+  echo "  SYNTHESE DE L'ANALYSE"
+  echo '--------------------------------------------------------------'
+  echo "  Detections            : $tot"
+  echo "  Repartition severite  : CRITICAL: $c_crit | HIGH: $c_high | MEDIUM: $c_med | LOW: $c_low | INFO: $c_info"
+  echo "  Modules concernes     : $mods"
+  echo "  Verdict               : $verdict"
+  echo ""
+}
+
+# Liste propre des IoCs utilisés (basename, dédupliqués) depuis info.json.
+iocs_csv_from_results() {
+  local results="$1"
+  [ -f "$results/info.json" ] || { printf '%s' "${2:-}"; return 0; }
+  python3 - "$results/info.json" <<'PY'
+import json, os, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    files = [os.path.basename(x) for x in (d.get("ioc_files") or [])]
+    files = sorted(set(files))
+    print(", ".join(files))
+except Exception:
+    pass
+PY
 }
 
 make_report() {
@@ -788,6 +1092,9 @@ make_report() {
     echo "Analyste         : ${ANALYST:-$(whoami)}"
     echo "Plateforme       : $platform"
     echo "Type d'analyse   : ${analysis_type:-n/a}"
+    echo "Structure        : ${STRUCTURE_NAME:-non renseignée}"
+    echo "Consentement     : consentement écrit recueilli"
+    echo "Versions outil   : wrapper ${VERSION:-n/a} / MVT $(mvt_version_local 2>/dev/null || echo n/a)"
     echo ""
     echo '--------------------------------------------------------------'
     echo '  STATUT DU RAPPORT'
@@ -805,37 +1112,32 @@ make_report() {
     echo '--------------------------------------------------------------'
     echo '  IDENTIFICATION DU DISPOSITIF'
     echo '--------------------------------------------------------------'
-    if [ -n "$device" ] && [ "$device" != "modèle non détecté automatiquement" ]; then
-      local _imei="" _serial="" _brand="" _model="" _storage="" _os=""
-      while IFS= read -r _line; do
-        case "$_line" in
-          IMEI:*)                    _imei="${_line#IMEI: }" ;;
-          "Numero de serie:"*)       _serial="${_line#Numero de serie: }" ;;
-          Marque:*)                  _brand="${_line#Marque: }" ;;
-          Modele:*)                  _model="${_line#Modele: }" ;;
-          "Capacite stockage:"*)     _storage="${_line#Capacite stockage: }" ;;
-          "Systeme d exploitation:"*) _os="${_line#Systeme d exploitation: }" ;;
-        esac
-      done <<< "$device"
-      printf '  %-25s : %s\n' "IMEI" "${_imei:-non disponible}"
-      printf '  %-25s : %s\n' "Numero de serie" "${_serial:-non disponible}"
-      printf '  %-25s : %s\n' "Marque" "${_brand:-non disponible}"
-      printf '  %-25s : %s\n' "Modele" "${_model:-non disponible}"
-      printf '  %-25s : %s\n' "Capacite stockage" "${_storage:-non disponible}"
-      printf '  %-25s : %s\n' "Systeme d exploitation" "${_os:-non disponible}"
-    else
-      echo "  Informations sur l'appareil non disponibles."
-    fi
-    echo ''
-    if [ -n "$iocs_csv" ]; then
-      echo "IoCs utilisés    : $iocs_csv"
-    else
-      echo "IoCs utilisés    : (aucun; IoCs officiels MVT éventuels)"
-    fi
-    echo ''
-    echo '--------------------------------------------------------------'
-    echo '  MENACES / INDICATEURS DE COMPROMISSION DETECTES'
-    echo '--------------------------------------------------------------'
+  local _dev_lines=""
+  _dev_lines="$(extract_device_details "$results" 2>/dev/null)"
+  if [ -z "$_dev_lines" ] && [ -n "$evidence_dir" ] && [ -d "$evidence_dir" ]; then
+    _dev_lines="$(extract_device_details "$evidence_dir" 2>/dev/null)"
+  fi
+  if [ -n "$_dev_lines" ]; then
+    printf '  %s\n' "$_dev_lines"
+  else
+    echo "  Informations sur l'appareil non disponibles."
+  fi
+  echo ''
+  if [ -n "$iocs_csv" ]; then
+    echo "IoCs utilisés    : $iocs_csv"
+  elif [ -n "$results" ] && [ -f "$results/info.json" ]; then
+    echo "IoCs utilisés    : $(iocs_csv_from_results "$results")"
+  else
+    echo "IoCs utilisés    : (aucun; IoCs officiels MVT éventuels)"
+  fi
+  echo ''
+  echo '--------------------------------------------------------------'
+  echo '  MENACES / INDICATEURS DE COMPROMISSION DETECTES'
+  echo '--------------------------------------------------------------'
+  detection_synthesis "$results"
+  echo ''
+  detection_stats "$results"
+  echo ''
     if [ "${#det[@]}" -eq 0 ]; then
       echo "  [INFO] Aucune menace correspondant aux IoCs n'a été détectée."
     else
@@ -852,7 +1154,7 @@ make_report() {
     fi
     echo ''
     echo '--------------------------------------------------------------'
-    echo '  MODULES EXECUTES (fichiers produits)'
+    echo '  MODULES EXECUTES'
     echo '--------------------------------------------------------------'
     mapfile -t files < <(find "$results" -maxdepth 1 -type f \( -name '*.json' -o -name '*.csv' \) ! -name '*_detected.json' 2>/dev/null | LC_ALL=C sort | sed "s|$results/||")
     if [ "${#files[@]}" -gt 0 ]; then
@@ -905,14 +1207,7 @@ make_report() {
   fi
   hline
 }
-# ------------------------------------------------------------------
-# Triage passif non-invasif (phase 1 de la méthodologie - TinyCheck)
-# Observation du trafic réseau via un point d'accès instrumenté, SANS
-# intervention sur le terminal et SANS notification à l'agresseur.
-# Uniquement les flux liés aux appareils et comptes de la personne
-# accompagnée (loi Godfrain, consentement confirmé avant appel).
-# TinyCheck reste OPTIONNEL : sans binaire, on documente la limite et
-# on propose l'orientation, sans jamais échouer l'analyse (non-invasive).
+
 triage_passif_tinycheck() {
   local platform="$1"
   custody_log "Triage passif ($platform) : TinyCheck non-invasif sur les flux de la personne accompagnée."
@@ -950,6 +1245,7 @@ orientation_accompagnement() {
   echo "  l'agresseur et détruit la preuve - aucune remédiation n'est"
   echo '  engagée avant scellage et plainte.'
   echo '--------------------------------------------------------------'
-  custody_log "Accompagnement proposé ($platform) : 3919, 116 006, Hubertine, CNIL, Cybermalveillance, Echap, commissaire de justice."
+  custody_log "Accompagnement proposé ($platform) : 3919, 116 006, Centre Hubertine Auclert, CNIL, Cybermalveillance, Echap, commissaire de justice."
   return 0
 }
+

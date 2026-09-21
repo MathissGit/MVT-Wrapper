@@ -270,6 +270,7 @@ config_menu() {
         "VirusTotal : définir la clé API   [$(mask_secret "${MVT_VT_API_KEY:-}")]" \
         "Verrouillage des preuves  [$( [ "${LOCK_EVIDENCE:-yes}" = "yes" ] && echo activé || echo désactivé )]" \
         "Analyste [${ANALYST:-$(whoami)}]" \
+        "Structure [${STRUCTURE_NAME:-non renseignée}]" \
         "Retour")"
     echo ""
     
@@ -340,6 +341,20 @@ config_menu() {
            log_info "Analyste inchangé."
          fi
          continue_or_back "Définir l'analyste" 
+         ;;
+     5) 
+         screen_clear
+         new_struct="$(ask_input "Nom de la structure :" "${STRUCTURE_NAME:-}")"
+         if [ -n "$new_struct" ]; then
+           STRUCTURE_NAME="$new_struct"
+           config_set_value "STRUCTURE_NAME" "$new_struct"
+           log_ok "Structure enregistrée : $STRUCTURE_NAME"
+         else
+           STRUCTURE_NAME=""
+           config_set_value "STRUCTURE_NAME" ""
+           log_warn "Structure effacée (mention « non renseignée » au rapport)."
+         fi
+         continue_or_back "Définir la structure" 
          ;;
       *) 
          return 0 
@@ -858,9 +873,14 @@ EOF
     esac
     if [ "${mvt_cmd[0]}" = "mvt-android" ] && [ "$ANALYSIS_TYPE" = "androidqf" ] \
        && [ "${ENABLE_VIRUSTOTAL:-no}" = "yes" ] && [ -n "${MVT_VT_API_KEY:-}" ]; then
-      export MVT_VT_API_KEY
-      mvt_cmd+=(--virustotal)
-      log_info "VirusTotal activé (hash d'APK non-système)."
+      # Choix interactif à chaque analyse : la comparaison avec la base VirusTotal est longue
+      if ask_yesno "Vérifier les APK non-système sur VirusTotal pour CETTE analyse ? (comparaison longue avec la base VT)" "n"; then
+        export MVT_VT_API_KEY
+        mvt_cmd+=(--virustotal)
+        log_info "VirusTotal activé pour cette analyse (hash d'APK non-système)."
+      else
+        log_warn "VirusTotal ignoré pour cette analyse (comparaison VT longue non souhaitée)."
+      fi
     fi
   fi
   # --fast n'est supporté que par mvt-ios check-backup/check-fs ;
@@ -932,15 +952,15 @@ main_menu() {
     opt="$(menu_select "Que souhaitez-vous faire ?" \
         "Lancer une analyse" \
         "Gérer les IoCs" \
-        "Configuration (VirusTotal, verrou, analyste)" \
-        "Vérifier / installer les dépendances" \
+        "Configuration" \
+        "Vérifier les dépendances" \
         "Quitter")"
     echo ""
     case "$opt" in
       *analyse*)  screen_clear; cmd_analyse;      continue_or_back "Lancer une analyse" ;;
       *IoCs*)     screen_clear; iocs_menu;        continue_or_back "Gérer les IoCs" ;;
-      *onfig*)    screen_clear; config_menu;      continue_or_back "Configuration" ;;
-      *installer*) screen_clear; install_shortcut; continue_or_back "Vérifier / installer les dépendances" ;;
+      *config*)    screen_clear; config_menu;      continue_or_back "Configuration" ;;
+      *installer*) screen_clear; install_shortcut; continue_or_back "Vérifier les dépendances" ;;
       *) echo ""; log_ok "Au revoir."; return 0 ;;
     esac
   done
