@@ -333,20 +333,106 @@ verify_hashes() {
   ( cd "$dir" && sha256sum -c SHA256SUMS.txt ) >/dev/null 2>&1
 }
 
-# Passe un dossier en lecture seule (chmod a-w, et chattr +i si root).
+# Passage en lecture seule (chmod a-w, et chattr +i si root) -- ancienne méthode.
+# Depuis 1.4 : SEAL_METHOD pilote le scellement ; "encrypt" (défaut) ne verrouille
+# plus rien (dossier supprimable). "lock" conserve l'ancien comportement.
 lock_dir() {
   local dir="$1"
-  if [ "${LOCK_EVIDENCE:-yes}" = "yes" ]; then
-    chmod -R a-w "$dir" 2>/dev/null
-    if [ "$(id -u)" = 0 ]; then
-      chattr -R +i "$dir" 2>/dev/null
-      log_ok "Preuves verrouillées en lecture seule (chattr +i): $dir"
-    else
-      log_ok "Preuves verrouillées en lecture seule (chmod a-w): $dir"
-    fi
-  else
-    log_warn "Verrouillage des preuves désactivé - dossier modifiable."
+  case "${SEAL_METHOD:-encrypt}" in
+    encrypt)
+      seal_encrypted "$dir"
+      ;;
+    lock)
+      if [ "${LOCK_EVIDENCE:-yes}" = "no" ]; then
+        log_warn "Verrouillage des preuves désactivé - dossier modifiable."
+        return 0
+      fi
+      chmod -R a-w "$dir" 2>/dev/null
+      if [ "$(id -u)" = 0 ]; then
+        chattr -R +i "$dir" 2>/dev/null
+        log_ok "Preuves verrouillées en lecture seule (chattr +i): $dir"
+      else
+        log_ok "Preuves verrouillées en lecture seule (chmod a-w): $dir"
+      fi
+      ;;
+    no|off)
+      log_warn "Scellement des preuves désactivé - dossier modifiable."
+      ;;
+    *)
+      log_warn "SEAL_METHOD inconnue ('$SEAL_METHOD') - aucun scellement."
+      ;;
+  esac
+}
+
+# ---- Scellement par CHIFFREMENT (AES-256, mot de passe) + suppression du clair ----
+# Preuves inaltérables (chiffrées) MAIS dossier restant supprimable : c'est le
+# comportement demandé ("sceller sans bloquer la suppression").
+seal_encrypted() {
+  local dir="$1" enc pw pw1 pw2 nb
+  [ -d "$dir" ] || return 0
+  enc="${dir}.aes256.tar.gz"
+  nb="$(find "$dir" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  custody_log "Scellement par chiffrement du dossier de preuve $dir ($nb fichier(s))..."
+
+  printf 'Mot de passe de scellement AES-256 (≥ 8 caractères) : ' >&2
+  IFS= read -r -s pw1 || return 1
+  echo >&2
+  printf 'Confirmez le mot de passe : ' >&2
+  IFS= read -r -s pw2 || return 1
+  echo >&2
+  if [ -z "$pw1" ] || [ "$pw1" != "$pw2" ]; then
+    log_err "Mot de passe vide ou non identique - scellement annulé."
+    return 1
   fi
+  unset pw2; pw="$pw1"; unset pw1
+
+  log_info "Chiffrement AES-256 en cours ($dir -> $enc)..."
+  if ! tar czf - -C "$(dirname "$dir")" "$(basename "$dir")" 2>/dev/null | \
+       openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 \
+         -pass "pass:$pw" -out "$enc" 2>/dev/null; then
+    log_err "Échec du chiffrement - version claire CONSERVÉE."
+    rm -f "$enc"
+    return 1
+  fi
+  if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "pass:$pw" \
+         -in "$enc" 2>/dev/null | tar tz >/dev/null 2>&1; then
+    log_err "Échec de la VÉRIFICATION du déchiffrement - version claire CONSERVÉE, archive supprimée."
+    rm -f "$enc"
+    return 1
+  fi
+  local h; h="$(sha256sum "$enc" | awk '{print $1}')"
+  custody_log "Preuves scellées par chiffrement : $enc (SHA256 $h) ; clair supprimé."
+  log_ok "Preuves chiffrées et vérifiées : $enc (SHA256 $h)"
+
+  find "$dir" -type f -exec shred -u -z -n 1 {} \; 2>/dev/null
+  rm -rf "$dir" 2>/dev/null
+  log_ok "Version claire supprimée : $dir (preuves supprimables si besoin)."
+}
+
+# Décision analyste : déverrouille (chattr -i / chmod a-w) puis supprime les preuves.
+# $1 = chemin du dossier ; mot de passe requis si scellé par chiffrement.
+unseal_and_delete() {
+  local dir="$1" pw
+  [ -d "$dir" ] || { log_err "Dossier introuvable : $dir"; return 1; }
+  if [ -f "$dir.aes256.tar.gz" ]; then
+    printf 'Mot de passe de scellement pour SUPPRIMER les preuves : ' >&2
+    IFS= read -r -s pw || return 1
+    echo >&2
+    if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "pass:$pw" \
+           -in "$dir.aes256.tar.gz" 2>/dev/null | tar tz >/dev/null 2>&1; then
+      log_err "Mot de passe incorrect - suppression refusée."
+      return 1
+    fi
+    rm -f "$dir.aes256.tar.gz" 2>/dev/null
+  else
+    if [ "$(id -u)" = 0 ] && command -v chattr >/dev/null 2>&1; then
+      chattr -R -i "$dir" 2>/dev/null
+    fi
+    chmod -R u+w "$dir" 2>/dev/null
+  fi
+  rm -rf "$dir" 2>/dev/null
+  custody_log "Preuves supprimées (décision analyste) : $dir"
+  log_ok "Preuves supprimées : $dir"
 }
 
 # ------------------------------------------------------------------

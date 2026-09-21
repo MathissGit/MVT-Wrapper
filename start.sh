@@ -907,13 +907,10 @@ EOF
       "$(printf '%s' "$MVT_STIX2" | tr ':' '\n' | sed 's#^.*/##' | paste -sd ', ')" \
       "$case_dir" "$DEVICE_INFO" "$ANALYSIS_TYPE"
 
-  RESULTSIF=""
-  [ -d "$results" ] && [ -n "$(ls -A "$results" 2>/dev/null)" ] && RESULTSIF="$results"
-  if [ -n "$RESULTSIF" ]; then
-    mkdir -p "$case_dir/report"
-    cp -a "$results/." "$case_dir/report/" 2>/dev/null
-    custody_log "Copie des résultats d'analyse dans $case_dir/report"
-  fi
+  # Source unique des résultats : reports/CASE-.../ (aucun doublon copié dans les preuves).
+  # Le rapport et les JSON bruts ne sont plus dupliqués : l'analyse est déjà tracée et scellée
+  # (SHA256SUMS + chain_of_custody + audit.log gérés dans reports/ et evidence/).
+  log_info "Résultats d'analyse (source unique) : $results"
 
   # ---- Scellement du dossier de preuve ----
   # TOUT le contenu du dossier (dont chain_of_custody.txt) doit être écrit
@@ -998,6 +995,59 @@ dedicated_terminal() {
   esac
 }
 
+# Purge des preuves : retire le scellement (tell +i / déchiffre AES) puis supprime.
+# Avec argument : son regex CASE-XXX ; sinon : menu de sélection.
+#   ./start.sh purge            -> menu de sélection des affaires
+#   ./start.sh purge 20260911   -> purge l'affaire CASE-2026...-160330 (si elle existe)
+cmd_purge() {
+  local target="${1:-}" dir hdr enc
+  local -a dirs=() choices=()
+  for dir in "$EVIDENCE_DIR"/CASE-*; do
+    [ -d "$dir" ] && dirs+=("$dir")
+  done
+
+  local d
+  if [ -n "$target" ]; then
+    local found=""
+    for d in "${dirs[@]:-}"; do
+      case "$(basename "$d")" in
+        "$target"|*"$target"*) found="$d" ; break ;;
+      esac
+    done
+    [ -z "$found" ] && { log_err "Aucune affaire ne correspond à '$target'."; return 1; }
+    { unseal_and_delete "$found" && rm -rf -- "$found"; } || return 1
+    return 0
+  fi
+
+  if [ "${#dirs[@]}" -eq 0 ]; then
+    log_warn "Aucune affaire à purger dans $EVIDENCE_DIR."
+    return 0
+  fi
+  screen_clear
+  banner 'PURGE DES PREUVES'
+  echo "Affaires trouvées :"
+  declare -i i=0
+  for d in "${dirs[@]:-}"; do
+    i+=1
+    local sealed="(claire)"
+    [ -f "$d.aes" ] && sealed="(chiffré .aes)"
+    if lsattr -d "$d" 2>/dev/null | grep -q '\bi\b'; then sealed="(verrouillé +i)"; fi
+    printf '  %2d) %s  %s\n' "$i" "$(basename "$d")" "$sealed"
+  done
+  local sel
+  sel="$(ask_input "Numéro de l'affaire à purger (defaut: aucune) : " "")"
+  if [ -n "$sel" ] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#dirs[@]}" ]; then
+    d="${dirs[$((sel-1))]}"
+    log_warn "PURGE destrcutive : suppression définitive de $(basename "$d")"
+    if ask_yesno "Confirmer la suppression définitive des preuves ?" "n"; then
+      { unseal_and_delete "$d" && rm -rf -- "$d"; } && log_ok "Preuves purgées : $d" || log_err "Purge refusée."
+    else
+      log_warn "Purge annulée."
+    fi
+  fi
+  return 0
+}
+
 # ============================================================
 #  LANCEMENT
 # ============================================================
@@ -1016,6 +1066,7 @@ case "$SUB" in
   config)             config_menu ;;
   install)            install_shortcut ;;
   terminal|--dedicated) dedicated_terminal "${1:-analyse}" ;;
+  purge)                cmd_purge "$@" || rc=1 ;;
   -h|--help|help)     usage ;;
   *) log_err "Sous-commande inconnue : $SUB" ; usage ; exit 1 ;;
 esac
