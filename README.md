@@ -103,8 +103,10 @@ L'acquisition brute est préservée telle quelle.
 ### Rapport
 Dans `reports/CASE-.../` :
 
-- `rapport.txt` : menaces détectées avec une **explication simple** de chaque module, le modèle de l'appareil, les IoCs utilisés, l'état d'intégrité des preuves,
+- `rapport.txt` : **mentions obligatoires** (identité et **structure** d'accueil de l'analyste, date/heure/terminal, **consentement écrit** signé et recueilli avant analyse, versions wrapper/MVT, méthode + limites, IoCs utilisés), **identification du dispositif** (nom, marque, modèle, OS, build, IMEI, n° de série, numéro), **synthèse des menaces par niveau de gravité**, explication simple de chaque module, état d'intégrité des preuves — le tout horodaté et **scellé SHA256**,
 - les fichiers JSON bruts de MVT (dont `*_detected.json`).
+
+> ⚠️ La mention **« Consentement »** est vérifiée **obligatoirement** avant toute analyse : sans consentement écrit recueilli (et confirmé), le wrapper refuse de continuer.
 
 > ⚠️ Une « détection » ne signifie **pas automatiquement** que le téléphone est compromis : c'est un point de départ à confirmer par un analyste.
 

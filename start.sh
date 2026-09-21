@@ -956,11 +956,11 @@ main_menu() {
         "Vérifier les dépendances" \
         "Quitter")"
     echo ""
-    case "$opt" in
-      *analyse*)  screen_clear; cmd_analyse;      continue_or_back "Lancer une analyse" ;;
-      *IoCs*)     screen_clear; iocs_menu;        continue_or_back "Gérer les IoCs" ;;
-      *config*)    screen_clear; config_menu;      continue_or_back "Configuration" ;;
-      *installer*) screen_clear; install_shortcut; continue_or_back "Vérifier les dépendances" ;;
+    case "${opt,,}" in
+      *analyse*) screen_clear; cmd_analyse;       continue_or_back "Lancer une analyse" ;;
+      *iocs*)    screen_clear; iocs_menu;         continue_or_back "Gérer les IoCs" ;;
+      *config*)  screen_clear; config_menu;       continue_or_back "Configuration" ;;
+      *dépend*)  screen_clear; install_shortcut;  continue_or_back "Vérifier les dépendances" ;;
       *) echo ""; log_ok "Au revoir."; return 0 ;;
     esac
   done
