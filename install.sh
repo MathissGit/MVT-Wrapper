@@ -14,8 +14,13 @@ if [ ! -f "$SCRIPT_DIR/config.sh" ]; then
 
 # Racine du wrapper
 WRAPPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Secrets : .env à la racine (gitignoré, chmod 600). Chargé s'il existe.
+if [ -f "$WRAPPER_DIR/.env" ]; then
+  set -a; source "$WRAPPER_DIR/.env"; set +a
+fi
+
 EVIDENCE_DIR="${WRAPPER_DIR}/evidence"
-REPORTS_DIR="${WRAPPER_DIR}/reports"
 IOCS_DIR="${WRAPPER_DIR}/iocs"
 IOCS_CUSTOM_DIR="${IOCS_DIR}/custom"
 IOCS_MANAGED_DIR="${IOCS_DIR}/managed"
@@ -33,20 +38,54 @@ IOC_REPOS=(
 UPDATE_IOCS_BEFORE_ANALYSIS="yes"
 DOWNLOAD_OFFICIAL_IOCS="yes"
 
-# Acquisition / preuve
+# Scellement des preuves ("encrypt" | "lock" | "no") et verrouillage
+SEAL_METHOD="encrypt"
 LOCK_EVIDENCE="no"
 
+# Destination de l'archive chiffrée : vide = à côté du dossier de preuve.
+# Renseignez un autre volume si le dossier est trop volumineux pour être
+# archivé en plus sur place (ex. "/media/<user>/SAUVEGARDES").
+SEAL_DEST=""
+
 DEDICATED_TERMINAL="auto"
-MVT_VT_API_KEY=""
+
+# VirusTotal : la clé se renseigne dans le fichier .env (racine du wrapper),
+# la plus simple via `./start.sh config` -> « VirusTotal : definir la cle API ».
 ENABLE_VIRUSTOTAL="no"
 
-# Analyste par défaut (nom affiché dans le rapport)
+# Analyste par défaut
 ANALYST="Analyste"
+
+# Structure / collectif
+STRUCTURE_NAME=""
+
+# Version du wrapper
+VERSION="1.3.0"
 EOF
   chmod 600 "$SCRIPT_DIR/config.sh"
   echo "[install] config.sh généré."
 else
   echo "[install] config.sh présent."
+fi
+
+# Secrets : .env à la racine (clé VirusTotal), gitignoré, jamais dans config.sh.
+if [ ! -f "$SCRIPT_DIR/.env" ]; then
+  cat > "$SCRIPT_DIR/.env" <<'EOF'
+# Secrets du wrapper MVT — lu par config.sh au démarrage (gitignoré, chmod 600).
+# Clé API VirusTotal : https://www.virustotal.com/gui/my-apikey
+# La plus simple pour la saisir : ./start.sh config -> « VirusTotal : definir
+# la cle API ». Vous pouvez aussi éditer ce fichier puis relancer ./start.sh.
+MVT_VT_API_KEY=
+EOF
+  chmod 600 "$SCRIPT_DIR/.env"
+  echo "[install] .env généré (clé VirusTotal vide)."
+else
+  echo "[install] .env présent."
+fi
+if [ ! -s "$SCRIPT_DIR/.env" ] || ! grep -q '^MVT_VT_API_KEY=' "$SCRIPT_DIR/.env"; then
+  echo "[install] Pour utiliser VirusTotal : créez un compte gratuit"
+  echo "[install]   https://www.virustotal.com/gui/join-us"
+  echo "[install] puis définissez la clé dans le menu : ./start.sh config -> « VirusTotal : définir la clé API »."
 fi
 
 source "$SCRIPT_DIR/config.sh"
@@ -55,10 +94,10 @@ source "$SCRIPT_DIR/lib/common.sh"
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   SUDO="sudo"
-  have sudo || die "Lancez ce script en tant que root ou avec les permissions sudo pour sur votre utilisateur."
+  have sudo || die "Lancez ce script en tant que root ou avec les permissions sudo."
 fi
 
-# Téléchargement d'AndroidQF (dernière release GitHub, arch détectée)
+# Téléchargement d'AndroidQF
 install_androidqf() {
   local arch="${ANDROIDQF_ARCH:-}" tag asset_name url api
   [ -n "$arch" ] || case "$(uname -m)" in
@@ -101,10 +140,14 @@ install_platform_tools() {
   unzip -q -o "$zip" -d "$TOOLS_DIR"
   rm -f "$zip"
   chmod +x "$ADB_EXTRA_DIR/adb" "$ADB_EXTRA_DIR/fastboot" 2>/dev/null || true
-  [ -x "$ADB_EXTRA_DIR/adb" ] && log_ok "adb (platform-tools) : $ADB_EXTRA_DIR/adb" || log_warn "Échec du téléchargement des platform-tools."
+  if [ -x "$ADB_EXTRA_DIR/adb" ]; then
+    log_ok "adb (platform-tools) : $ADB_EXTRA_DIR/adb"
+  else
+    log_warn "Échec du téléchargement des platform-tools."
+  fi
 }
 
-mkdir -p "$EVIDENCE_DIR" "$REPORTS_DIR" "$IOCS_CUSTOM_DIR" "$IOCS_MANAGED_DIR" "$TOOLS_DIR"
+mkdir -p "$EVIDENCE_DIR" "$IOCS_CUSTOM_DIR" "$IOCS_MANAGED_DIR" "$TOOLS_DIR"
 
 banner '============================================'
 banner '  INSTALLATION : MVT / AndroidQF / Dépendances'
@@ -138,7 +181,7 @@ if ! have adb; then
   log_info "Installation d'ADB (Android Debug Bridge)..."
   if ! $SUDO apt-get install -y adb >/dev/null 2>&1; then
     if ! $SUDO apt-get install -y android-tools-adb >/dev/null 2>&1; then
-      log_warn "adp/apt ne fournit pas adb → téléchargement des Platform Tools Google"
+      log_warn "adb/apt ne fournit pas adb → téléchargement des Platform Tools Google"
       install_platform_tools
     fi
   fi
@@ -146,7 +189,7 @@ fi
 have adb && log_ok "  adb : $(adb version | head -n 1)"
 
 # ------------------------------------------------------------------
-# 2. pipx + PATH
+# pipx + PATH
 # ------------------------------------------------------------------
 log_info "Configuration de pipx ($HOME/.local/bin)..."
 have pipx || die "pipx n'a pas pu être installé."
@@ -184,14 +227,33 @@ fi
 # ------------------------------------------------------------------
 banner '==== Vérifications ===='
 ok=1
-have mvt        && log_ok "  MVT           OK ($(command -v mvt))" || { log_err "  MVT manquant" ; ok=0; }
-have adb        && log_ok "  adb           OK ($(command -v adb))" || log_warn "  adb manquant → configurez ADB_EXTRA_DIR dans config.sh"
-have ideviceinfo && log_ok "  libimobiledevice OK ($(command -v ideviceinfo))" || log_warn "  libimobiledevice manquant → mvt-ios ne pourra pas créer de backups iTunes"
-[ -x "$ANDROIDQF_BIN" ] && log_ok "  AndroidQF     OK ($ANDROIDQF_BIN)" || log_warn "  AndroidQF manquant"
+if have mvt; then
+  log_ok "  MVT           OK ($(command -v mvt))"
+else
+  log_err "  MVT manquant"
+  ok=0
+fi
+if have adb; then
+  log_ok "  adb           OK ($(command -v adb))"
+else
+  log_warn "  adb manquant → configurez ADB_EXTRA_DIR dans config.sh"
+fi
+if have ideviceinfo; then
+  log_ok "  libimobiledevice OK ($(command -v ideviceinfo))"
+else
+  log_warn "  libimobiledevice manquant → mvt-ios ne pourra pas créer de backups iTunes"
+fi
+if [ -x "$ANDROIDQF_BIN" ]; then
+  log_ok "  AndroidQF     OK ($ANDROIDQF_BIN)"
+else
+  log_warn "  AndroidQF manquant"
+fi
 
-[ "$ok" -eq 1 ] &&
-banner '==== Installation terminée ====' ||
-banner '==== Installation terminée (avec avertissements) ===='
+if [ "$ok" -eq 1 ]; then
+  banner '==== Installation terminée ===='
+else
+  banner '==== Installation terminée (avec avertissements) ===='
+fi
 
 cat <<EOF
 

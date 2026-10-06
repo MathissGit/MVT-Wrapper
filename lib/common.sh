@@ -32,7 +32,6 @@ screen_clear() {
 }
 
 # Titre ASCII (figlet) coloré, repli sur banner si figlet absent / sortie non-tty.
-# $1 = titre ; $2 = sous-titre facultatif.
 ascii_banner() {
   local title="${1:-MVT WRAPPER}" sub="${2:-}" w
   if [ -t 1 ] && have figlet; then
@@ -53,6 +52,76 @@ ascii_banner() {
 die() { log_err "$*"; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Version locale de MVT
+mvt_version_local() {
+  local v=""
+  if have mvt; then
+    v="$(mvt version 2>/dev/null | grep -i '^mvt' | awk '{print $2}' | head -n 1)"
+  fi
+  if [ -n "$v" ]; then
+    printf '%s' "$v"
+  else
+    return 1
+  fi
+}
+
+# ------------------------------------------------------------------
+# Versions de l'outil et de ses composants (traçabilité + rapport).
+#   $1 = composant (wrapper|mvt|mvt-ios|mvt-android|androidqf|adb|idevicebackup2)
+#   Sortie : numéro de version, ou "n/a".
+# ------------------------------------------------------------------
+tool_version_of() {
+  local name="$1" v=""
+  case "$name" in
+    wrapper)        v="${VERSION:-n/a}" ;;
+    mvt)            v="$(mvt_version_local 2>/dev/null || true)" ;;
+    mvt-ios)        have mvt-ios && v="$("$(command -v mvt-ios)" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)" ;;
+    mvt-android)    have mvt-android && v="$("$(command -v mvt-android)" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)" ;;
+    androidqf)      [ -x "${ANDROIDQF_BIN:-}" ] && v="$("$ANDROIDQF_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)" ;;
+    adb)            have adb && v="$("$(command -v adb)" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)" ;;
+    idevicebackup2) have idevicebackup2 && v="$("$(command -v idevicebackup2)" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)" ;;
+    *)              v="n/a" ;;
+  esac
+  printf '%s' "${v:-n/a}"
+}
+
+# Ligne récapitulative des versions wrapper + composants (une seule string).
+tool_versions() {
+  local parts=() c
+  for c in wrapper mvt mvt-ios mvt-android androidqf adb idevicebackup2; do
+    parts+=("$c $(tool_version_of "$c")")
+  done
+  printf '%s' "${parts[*]}"
+}
+
+# ------------------------------------------------------------------
+# Signature de la base d'indicateurs utilisée : nombre + fichiers,
+# commits des dépôts managed, dernière mise à jour.
+# ------------------------------------------------------------------
+ioc_base_signature() {
+  local f total=0 list=() names="" d latest="" repo h cd
+  while IFS= read -r f; do
+    total=$((total + 1))
+    d="$(stat -c '%y' "$f" 2>/dev/null | cut -d. -f1)"
+    if [ -n "$d" ] && [ "$d" \> "${latest:-}" ]; then latest="$d"; fi
+    list+=("$(basename "$f")")
+  done < <(find_ioc_files)
+  if [ "$total" -eq 0 ]; then
+    printf 'aucun fichier personnalisé (IoCs officiels MVT utilisés le cas échéant)'
+    return 0
+  fi
+  for f in "${list[@]:0:8}"; do names="${names}${names:+, }$f"; done
+  [ "${#list[@]}" -gt 8 ] && names="$names, ..."
+  printf '%d fichier(s) : %s — dernière mise à jour %s' "$total" "$names" "${latest:-n/a}"
+  for repo in "$IOCS_MANAGED_DIR"/*/; do
+    [ -d "$repo/.git" ] || continue
+    h="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo n/a)"
+    cd="$(git -C "$repo" log -1 --format=%cs 2>/dev/null || true)"
+    printf ' ; %s@%s (%s)' "$(basename "$repo")" "$h" "$cd"
+  done
+  return 0
+}
 
 # Ajoute ~/.local/bin et les outils téléchargés au PATH (si absents).
 ensure_path() {
@@ -96,6 +165,146 @@ ask_input() {
     read -r rep || return 1
     printf '%s' "$rep"
   fi
+}
+
+# ------------------------------------------------------------------
+# Fenêtre de sélection de DOSSIER (zenity / kdialog), avec repli en
+# saisie manuelle. Même approche que pick_acquisition_path, mais
+# --directory : on ne peut choisir qu'un dossier, pas un fichier.
+# Le dossier de départ est proposé ; rien n'est créé ni modifié ici.
+# ------------------------------------------------------------------
+pick_directory_gui() {
+  local title="$1" start="${2:-$PWD}" got=""
+  [ -d "$start" ] || start="$PWD"
+  if command -v zenity >/dev/null 2>&1; then
+    got="$(zenity --file-selection --directory --confirm-overwrite \
+            --title="$title" --filename="$start/" 2>/dev/null || true)"
+  elif command -v kdialog >/dev/null 2>&1; then
+    got="$(kdialog --getexistingdirectory "$start" 2>/dev/null || true)"
+  fi
+  printf '%s' "$got"
+}
+
+# Un chemin donné peut-il être un volume "amovible" (/media, /run/media,
+# /mnt) ? Sert à proposer ces emplacements comme candidats usuels.
+seal_is_removable_spot() {
+  case "$1" in
+    /media|/media/*|/run/media|/run/media/*|/mnt|/mnt/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Volumes réellement montés et inscriptibles : les emplacements classiques
+# d'un disque externe, pour l'utilisateur réel (le wrapper tourne souvent
+# en sudo, donc $USER vaut root alors que les disques appartiennent à
+# l'analyste). Ne liste QUE des points de montage avérés, sinon on
+# remonterait tous les ~/Documents, ~/Images... comme de fausses pistes.
+seal_mounted_candidates() {
+  local u base d
+  u="${SUDO_USER:-$USER}"
+  for base in "/media/$u" "/run/media/$u"; do
+    [ -d "$base" ] || continue
+    for d in "$base"/*; do
+      [ -d "$d" ] || continue
+      mountpoint -q "$d" 2>/dev/null || continue
+      [ -w "$d" ] || continue
+      printf '%s\n' "$d"
+    done
+  done
+}
+
+# Choix d'un dossier. La FENÊTRE GUI n'est ouverte qu'à la demande
+# ("Ouvrir le gestionnaire de fichiers") : ouvrir une fenêtre qui popup
+# en plein écran à l'entrée dans une option de menu est agressif, et
+# l'utilisateur ne peut alors plus corriger sa saisie au clavier.
+# $1 = titre  $2 = dossier de départ  $3.. = candidats supplémentaires
+# Imprime le chemin choisi ; vide si annulé.
+pick_directory() {
+  local title="$1" start="${2:-$PWD}" chosen="" c u dup n
+  shift 2 2>/dev/null || shift $#
+  local -a extra=("$@") uniq=() opts=()
+
+  # Candidats sans doublon : dossier de départ, extras, volumes montés.
+  for c in "$start" ${extra[@]+"${extra[@]}"}; do
+    [ -n "$c" ] || continue
+    dup=0
+    for u in ${uniq[@]+"${uniq[@]}"}; do [ "$u" = "$c" ] && { dup=1; break; }; done
+    [ "$dup" -eq 0 ] && uniq+=("$c")
+  done
+  if [ -t 0 ]; then
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      dup=0
+      for u in ${uniq[@]+"${uniq[@]}"}; do [ "$u" = "$c" ] && { dup=1; break; }; done
+      [ "$dup" -eq 0 ] && uniq+=("$c")
+    done < <(seal_mounted_candidates)
+  fi
+
+  # Menu fléché si le terminal le permet, sinon saisie directe.
+  if [ -t 0 ] && [ "${#uniq[@]}" -gt 1 ]; then
+    for c in "${uniq[@]}"; do
+      if [ -d "$c" ]; then
+        opts+=("$c  [$(seal_human_bytes "$(seal_avail_bytes "$c")") libres]")
+      else
+        opts+=("$c  (à créer)")
+      fi
+    done
+    opts+=("Ouvrir le gestionnaire de fichiers…")
+    opts+=("Saisie manuelle du chemin")
+    opts+=("Revenir au défaut (à côté du dossier de preuve)")
+
+    # menu_select_idx renvoie un index 1-based ; on raisonne donc en 1-based.
+    local n_cand="${#uniq[@]}" pick_gui pick_manu pick_def i
+    pick_gui=$(( n_cand + 1 ))
+    pick_manu=$(( n_cand + 2 ))
+    pick_def=$(( n_cand + 3 ))
+
+    chosen="$(menu_select_idx "$title" "${opts[@]}")"
+    case "$chosen" in
+      "$pick_gui")
+        chosen="$(pick_directory_gui "$title" "$start")"
+        if [ -z "$chosen" ]; then
+          log_info "Fenêtre de sélection fermée - rien n'est changé."
+          printf '%s' ""
+          return 0
+        fi
+        ;;
+      "$pick_manu")
+        chosen="$(ask_input "$title (chemin du dossier) :" "$start")"
+        ;;
+      "$pick_def")
+        printf '%s' "-"
+        return 0
+        ;;
+      *)
+        # Libellé choisi : le chemin réel est le candidat correspondant
+        # (le libellé affiché est suffixé par l'espace libre).
+        i=$(( chosen - 1 ))
+        if [ "$i" -ge 0 ] && [ "$i" -lt "$n_cand" ]; then
+          chosen="${uniq[$i]}"
+        else
+          chosen=""
+        fi
+        ;;
+    esac
+  else
+    # Repli non interactif : on propose les candidats puis la saisie.
+    if [ "${#uniq[@]}" -gt 1 ]; then
+      local line="" n
+      for c in "${uniq[@]}"; do
+        if [ -d "$c" ]; then
+          line="$line$c  [$(seal_human_bytes "$(seal_avail_bytes "$c")") libres]
+"
+        else
+          line="$line$c  (à créer)
+"
+        fi
+      done
+      printf '%s' "$line" >&2
+    fi
+    chosen="$(ask_input "$title (chemin du dossier) :" "$start")"
+  fi
+  printf '%s' "$chosen"
 }
 
 # ------------------------------------------------------------------
@@ -174,7 +383,8 @@ menu_select_idx() {
 # navigation ne font rien ; seul EOF (Ctrl-D) fait return 1.
 arrow_select() {
   local prompt="$1" want_idx="$2"; shift 2
-  local opts=("$@") total="${#opts[@]}" sel=0 key seq i
+  local opts=("$@")
+  local total="${#opts[@]}" sel=0 key seq i
 
   local c_rev="${C_REV:-\033[7m}"
   local c_reset="${C_RESET:-\033[0m}"
@@ -298,6 +508,27 @@ to_relative() {
   esac
 }
 
+# Valeur booléenne d'une clé dans un plist (binaire ou XML) via python3/plistlib.
+# Sortie : yes | no | unknown.
+plist_key_bool() {
+  local file="$1" key="$2"
+  python3 - "$file" "$key" <<'PY'
+import plistlib, sys
+try:
+    with open(sys.argv[1], "rb") as fh:
+        d = plistlib.load(fh)
+    v = d.get(sys.argv[2])
+    if v is True:
+        print("yes")
+    elif v is False:
+        print("no")
+    else:
+        print("unknown")
+except Exception:
+    print("unknown")
+PY
+}
+
 # Journalisation (chaîne de traçabilité / audit) : écrit une ligne
 # horodatée dans les fichiers définis par CUSTODY_FILE et AUDIT_FILE.
 custody_log() {
@@ -307,30 +538,80 @@ audit_log() {
   [ -n "${AUDIT_FILE:-}" ] && printf '%s | %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$AUDIT_FILE"
 }
 
+# Indicateur d'activité : spinner + chrono (secondes) pendant une commande
+# longue sans retour visuel (backup iTunes, déchiffrement, modules MVT…).
+# Le flux de la commande est redirigé vers $2 (fichier log) pour ne pas
+# mélanger spinner et sortie ; à la fin, l'appelant peut afficher le tail.
+#   $1 = libellé   $2 = log ('' = /dev/null)   ... = commande
+# Retourne le code de sortie de la commande.
+run_with_progress() {
+  local label="$1" log="$2" pid rc t0 i chars
+  shift 2
+  if [ "${CI:-}" = "true" ] || [ ! -t 1 ] || [ -z "${TERM:-}" ]; then
+    if [ -n "$log" ]; then
+      "$@" >"$log" 2>&1
+    else
+      "$@" >/dev/null 2>&1
+    fi
+    return $?
+  fi
+  if [ -n "$log" ]; then
+    "$@" >"$log" 2>&1 &
+  else
+    "$@" >/dev/null 2>&1 &
+  fi
+  pid=$!
+  chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  t0=$(date +%s)
+  i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s %s  %ds   ' "${chars:$((i%10)):1}" "$label" "$(( $(date +%s) - t0 ))"
+    sleep 0.25
+    i=$((i+1))
+  done
+  wait "$pid"
+  rc=$?
+  printf '\r%80s\r' ''
+  return "$rc"
+}
+
 # ------------------------------------------------------------------
-# Intégrité des preuves (non-altération, aspect juridique)
+# Intégrité des preuves (non-altération et juridique)
 # ------------------------------------------------------------------
 
-# Manifeste sha256 de tous les fichiers d'un dossier (chemins relatifs).
-# $1 = dossier ; $2 = fichier de sortie (SHA256SUMS).
+# Manifeste sha256 de tous les fichiers d'un dossier (chemins relatifs)
 hash_tree() {
-  local dir="$1" out="$2" start pwd_save
-  local f rel
-  mapfile -t files < <(find "$dir" -type f ! -name 'SHA256SUMS.txt' ! -name 'SHA256SUMS-acquisition.txt' 2>/dev/null | LC_ALL=C sort)
+  local dir="$1" out="$2" pwd_save
   pwd_save="$(pwd)"
-  : > "$out"
   cd "$dir" || return 1
-  for f in "${files[@]}"; do
-    rel="${f#"$dir"/}"
-    sha256sum "$rel" >> "$out" 2>/dev/null || sha256sum "$f" >> "$out" 2>/dev/null
-  done
+  printf 'Manifeste SHA256 généré le %s par %s' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${ANALYST:-$(whoami)}" > "$out"
+  find . -type f \
+        ! -name 'SHA256SUMS.txt' ! -name 'SHA256SUMS-acquisition.txt' \
+        ! -name 'rapport.txt' ! -name 'rapport.pdf' -print0 2>/dev/null \
+    | LC_ALL=C sort -z \
+    | xargs -0 -r -P "$(nproc 2>/dev/null || echo 4)" sha256sum \
+    | sed -E 's#^([0-9a-f]{64}  )\./#\1#' \
+    | LC_ALL=C sort -k2 >> "$out"
   cd "$pwd_save" || true
 }
 
-# Vérifie un manifeste SHA256SUMS. Retour 0 si OK.
-verify_hashes() {
-  local dir="$1"
-  ( cd "$dir" && sha256sum -c SHA256SUMS.txt ) >/dev/null 2>&1
+# Vérification d'un manifeste SHA256 en parallèle
+verify_manifest() {
+  local dir="$1" manifest="${2:-SHA256SUMS.txt}" cores tmp rc pwd_save
+  cores="$(nproc 2>/dev/null || echo 4)"
+  tmp="$(mktemp -d)"
+  pwd_save="$(pwd)"
+  cd "$dir" || { rm -rf "$tmp"; return 1; }
+  grep -v '^#' "$manifest" 2>/dev/null \
+    | awk -v n="$cores" -v t="$tmp" '{ f = sprintf("%s/chunk.%02d", t, NR % n); print > f }'
+  mapfile -t chunks < <(find "$tmp" -type f)
+  # shellcheck disable=SC2016
+  printf '%s\0' "${chunks[@]}" | xargs -0 -r -P "$cores" -n1 sh -c 'sha256sum -c "$1" >/dev/null 2>&1' sh
+  rc=$?
+  rm -rf "$tmp"
+  cd "$pwd_save" || true
+  [ "$rc" -eq 0 ]
 }
 
 # Passage en lecture seule (chmod a-w, et chattr +i si root) -- ancienne méthode.
@@ -367,64 +648,449 @@ lock_dir() {
 # ---- Scellement par CHIFFREMENT (AES-256, mot de passe) + suppression du clair ----
 # Preuves inaltérables (chiffrées) MAIS dossier restant supprimable : c'est le
 # comportement demandé ("sceller sans bloquer la suppression").
-seal_encrypted() {
-  local dir="$1" enc pw pw1 pw2 nb
-  [ -d "$dir" ] || return 0
-  enc="${dir}.aes256.tar.gz"
-  nb="$(find "$dir" -type f 2>/dev/null | wc -l | tr -d ' ')"
-  custody_log "Scellement par chiffrement du dossier de preuve $dir ($nb fichier(s))..."
 
+# Taille totale (octets) du dossier à sceller.
+seal_needed_bytes() {
+  du -sb "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# Espace libre (octets) sur le FS qui PORTERA l'archive chiffrée.
+seal_avail_bytes() {
+  local target="$1"
+  while [ -n "$target" ] && [ ! -d "$target" ]; do target="$(dirname "$target")"; done
+  df -B1 --output=avail "${target:-/}" 2>/dev/null | tail -1 | tr -dc '0-9'
+}
+
+# Le plus gros fichier (octets) : plancher d'espace du mode flux.
+seal_biggest_file_bytes() {
+  find "$1" -type f -printf '%s\n' 2>/dev/null | sort -rn | head -1
+}
+
+# Formate un nombre d'octets pour l'affichage (ex. 33G). Repli sur l'octet.
+seal_human_bytes() {
+  local b="${1:-0}"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec --suffix=B "$b" 2>/dev/null && return 0
+  fi
+  printf '%s octets' "$b"
+}
+
+# Etiquette lisible d'un volume : "ext4, 9.1GB libres". Sert à rappeler sur
+# QUEL disque l'archive va réellement atterrir.
+seal_volume_label() {
+  local p="$1" fs avail
+  while [ -n "$p" ] && [ ! -d "$p" ]; do p="$(dirname "$p")"; done
+  fs="$(df -PT "$p" 2>/dev/null | awk 'NR==2 {print $2}')"
+  avail="$(seal_avail_bytes "$p")"
+  printf '%s, %s libres' "${fs:-?}" "$(seal_human_bytes "${avail:-0}")"
+}
+
+# ------------------------------------------------------------------
+# Validation d'une destination de scellement. N'écrit RIEN : renvoie
+# seulement un verdict, l'appelant décide (c'est lui qui affiche et
+# qui demande confirmation avant toute création).
+#   0 = chemin utilisable (dossier existant, inscriptible)
+#   1 = chemin absent (peut être créé)
+#   2 = chemin inutilisable (fichier, non-inscriptible, disque non monté)
+# Le motif est renvoyé sur stdout.
+# ------------------------------------------------------------------
+
+# Expansion du ~ de début, SANS eval (une saisie utilisateur ne doit
+# jamais être réinterprétée comme du shell). Sans cela, `mkdir -p "~/X"`
+# créait un dossier littéralement nommé "~".
+seal_expand_tilde() {
+  local p="$1"
+  case "$p" in
+    "~")    printf '%s' "$HOME" ;;
+    "~/"*)  printf '%s/%s' "${HOME%/}" "${p#\~/}" ;;
+    *)      printf '%s' "$p" ;;
+  esac
+}
+
+# Le chemin est-il sous un point de montage "amovible" (/media, /run/media,
+# /mnt) dont le volume attendu n'est PAS monté ? Dans ce cas un `mkdir -p`
+# créerait le dossier sur le disque INTERNE : l'archive atterrirait au
+# mauvais endroit, en silence. C'est le piège classique du disque
+# débranché au moment du scellement.
+seal_unmounted_risk() {
+  local p="$1" q mount prev
+  # Un chemin relatif (ou contenant ".") ne peut jamais être sous /media :
+  # on le ramène d'abord en absolu, sinon dirname(".") boucle indéfiniment.
+  case "$p" in
+    /*) ;;
+    *)  p="$PWD/$p" ;;
+  esac
+  while [ "$p" != "/" ] && [ -n "$p" ]; do
+    case "$p" in
+      /media/*|/run/media/*|/mnt/*)
+        # Cherche le point de montage le plus proche en remontant.
+        q="$p"; mount=""
+        while [ "$q" != "/" ] && [ -n "$q" ]; do
+          if mountpoint -q "$q" 2>/dev/null; then mount="$q"; break; fi
+          prev="$q"; q="$(dirname "$q")"
+          [ "$q" = "$prev" ] && break
+        done
+        # /media/<user> est un simple dossier sur la racine : ce ne sont
+        # que ses sous-dossiers (les disques montés) qui sont des points
+        # de montage. Sans volume monté plus bas, le chemin est fantôme.
+        [ -z "$mount" ] && return 0
+        return 1
+        ;;
+    esac
+    prev="$p"; p="$(dirname "$p")"
+    [ "$p" = "$prev" ] && break
+  done
+  return 1
+}
+
+seal_validate_dest() {
+  local raw="$1" path probe parent
+  path="$(seal_expand_tilde "$raw")"
+
+  if [ -z "$path" ]; then
+    printf 'chemin vide'; return 2
+  fi
+
+  # Un chemin relatif est ambigu : il dépendrait du répertoire courant au
+  # moment du scellement, qui n'est pas forcément le même. On exige un
+  # chemin absolu plutôt que de créer un dossier au hasard.
+  case "$path" in
+    /*) ;;
+    *)  printf '%s n'"'"'est pas un chemin absolu (ex. /media/ryuu/SAUVEGARDES)' "$path"
+        return 2 ;;
+  esac
+
+  if [ -e "$path" ]; then
+    if [ ! -d "$path" ]; then
+      printf '%s existe mais n'"'"'est pas un dossier' "$path"; return 2
+    fi
+    if [ ! -w "$path" ]; then
+      printf '%s n'"'"'est pas accessible en écriture' "$path"; return 2
+    fi
+    # [ -w ] peut mentir sur un volume monté en lecture seule : on teste
+    # pour de vrai en créant puis supprimant un fichier.
+    probe="$path/.mvt_seal_test_$$"
+    if ! ( : > "$probe" ) 2>/dev/null; then
+      printf '%s refuse l'"'"'écriture (volume monté en lecture seule ?)' "$path"; return 2
+    fi
+    rm -f "$probe" 2>/dev/null
+    printf '%s' "$path"; return 0
+  fi
+
+  # Absent : vérifie d'abord qu'on ne va pas créer un dossier fantôme sur
+  # le disque interne parce qu'un disque externe serait débranché.
+  if seal_unmounted_risk "$path"; then
+    printf '%s est sous un point de montage non monté : le dossier serait créé sur le disque interne. Montez le disque puis réessayez.' "$path"
+    return 2
+  fi
+
+  # Le parent doit exister et être inscriptible, sinon mkdir échouera.
+  parent="$(dirname "$path")"
+  if [ ! -d "$parent" ]; then
+    printf 'le dossier parent %s n'"'"'existe pas' "$parent"; return 2
+  fi
+  if [ ! -w "$parent" ]; then
+    printf 'le dossier parent %s n'"'"'est pas accessible en écriture' "$parent"; return 2
+  fi
+  printf '%s' "$path"; return 1
+}
+
+# Destination de l'archive chiffrée. SEAL_DEST (config) prime ; sinon à côté
+# du dossier de preuve. modes: dir | archive | stream
+seal_dest_path() {
+  local dir="$1" mode="$2" base="${SEAL_DEST:-}"
+  [ -n "$base" ] || base="$(dirname "$dir")"
+  case "$mode" in
+    archive) printf '%s/%s.aes256.tar.gz' "$base" "$(basename "$dir")" ;;
+    stream)  printf '%s/%s.aes256.d'      "$base" "$(basename "$dir")" ;;
+    *)       printf '%s' "$base" ;;
+  esac
+}
+
+# Trace un échec de scellement : l'anomalie doit être visible dans la chaîne
+# de traçabilité, pas seulement sur stderr (l'écran est perdu, le journal reste).
+seal_incident() {
+  log_err "$*"
+  custody_log "INCIDENT : $*"
+  audit_log "SCELLEMENT : $*"
+}
+
+# Saisie du mot de passe (2 fois). Refuse le non-TTY explicitement au lieu de
+# d'échouer en silence sur un read qui renvoie EOF.
+seal_read_password() {
+  local pw1 pw2
+  if [ ! -t 0 ]; then
+    log_err "Scellement impossible : aucun terminal (stdin non interactif) pour saisir le mot de passe."
+    return 1
+  fi
   printf 'Mot de passe de scellement AES-256 (≥ 8 caractères) : ' >&2
-  IFS= read -r -s pw1 || return 1
+  IFS= read -r -s pw1 || { echo >&2; log_err "Saisie du mot de passe interrompue - scellement annulé."; return 1; }
   echo >&2
   printf 'Confirmez le mot de passe : ' >&2
-  IFS= read -r -s pw2 || return 1
+  IFS= read -r -s pw2 || { echo >&2; log_err "Saisie de la confirmation interrompue - scellement annulé."; return 1; }
   echo >&2
-  if [ -z "$pw1" ] || [ "$pw1" != "$pw2" ]; then
-    log_err "Mot de passe vide ou non identique - scellement annulé."
+  if [ -z "$pw1" ]; then
+    log_err "Mot de passe vide - scellement annulé."
     return 1
   fi
-  unset pw2; pw="$pw1"; unset pw1
+  if [ "$pw1" != "$pw2" ]; then
+    log_err "Les deux mots de passe diffèrent - scellement annulé."
+    return 1
+  fi
+  if [ "${#pw1}" -lt 8 ]; then
+    log_err "Mot de passe trop court (${#pw1} caractères, 8 minimum) - scellement annulé."
+    return 1
+  fi
+  printf '%s' "$pw1"
+}
 
-  log_info "Chiffrement AES-256 en cours ($dir -> $enc)..."
-  if ! tar czf - -C "$(dirname "$dir")" "$(basename "$dir")" 2>/dev/null | \
-       openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 \
-         -pass "pass:$pw" -out "$enc" 2>/dev/null; then
-    log_err "Échec du chiffrement - version claire CONSERVÉE."
-    rm -f "$enc"
-    return 1
-  fi
-  if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "pass:$pw" \
-         -in "$enc" 2>/dev/null | tar tz >/dev/null 2>&1; then
-    log_err "Échec de la VÉRIFICATION du déchiffrement - version claire CONSERVÉE, archive supprimée."
-    rm -f "$enc"
-    return 1
-  fi
-  local h; h="$(sha256sum "$enc" | awk '{print $1}')"
-  custody_log "Preuves scellées par chiffrement : $enc (SHA256 $h) ; clair supprimé."
-  log_ok "Preuves chiffrées et vérifiées : $enc (SHA256 $h)"
+seal_encrypted() {
+  local dir="$1" enc streamdir pw nb need avail biggest mode seal_log destdir vwhy
+local vrc=0
+  [ -d "$dir" ] || return 0
+  nb="$(find "$dir" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  need="$(seal_needed_bytes "$dir")"; need="${need:-0}"
+  biggest="$(seal_biggest_file_bytes "$dir")"; biggest="${biggest:-0}"
+  custody_log "Scellement par chiffrement du dossier de preuve $dir ($nb fichier(s), $need octets)..."
 
-  find "$dir" -type f -exec shred -u -z -n 1 {} \; 2>/dev/null
+  # --- Destination : elle doit exister et être inscriptible AVANT tout.
+  # Sans cette vérification, un SEAL_DEST supprimé du disque depuis la
+  # config produisait un échec openssl obscur du type "Can't open ... for
+  # writing" alors que la version claire était intacte.
+  local destdir vwhy vrc
+  destdir="$(seal_dest_path "$dir" dir)"
+  vwhy="$(seal_validate_dest "$destdir")" || vrc=$?
+  if [ "$vrc" = 1 ]; then
+    mkdir -p "$vwhy" 2>/dev/null || {
+      seal_incident "Destination de scellement absente et création impossible : $vwhy. \
+Version claire CONSERVÉE."
+      return 1
+    }
+    destdir="$vwhy"
+  elif [ "$vrc" != 0 ]; then
+    seal_incident "Destination de scellement inutilisable : $vwhy. \
+Version claire CONSERVÉE : $dir"
+    return 1
+  fi
+
+  # --- Choix du mode selon l'espace disponible sur la destination ---
+  # Archive = 1x la taille (écriture du dossier, pic 2x avec le clair restant).
+  # Flux    = 1 fichier à la fois (pic = le plus gros fichier), mais produit un
+  #           dossier chiffré arborescent plutôt qu'une archive unique.
+  avail="$(seal_avail_bytes "$(seal_dest_path "$dir" dir)")"
+  mode="stream"
+  if [ "$avail" -gt $(( need + need / 10 )) ]; then
+    mode="archive"
+  fi
+
+  if [ "$mode" = "stream" ] && [ "$avail" -lt $(( biggest + biggest / 10 + 16 * 1024 * 1024 )) ]; then
+    seal_incident "Scellement impossible : espace insuffisant sur la destination \
+($(seal_human_bytes "$avail") libres pour un dossier de $(seal_human_bytes "$need")). \
+Libérez de l'espace ou renseignez la destination dans './start.sh config' \
+(« Destination de l'archive chiffrée ») pour viser un autre disque. \
+Version claire CONSERVÉE."
+    return 1
+  fi
+
+  if [ "$mode" = "stream" ]; then
+    log_warn "Espace insuffisant pour une archive unique ($(seal_human_bytes "$avail") libres \
+pour $(seal_human_bytes "$need")) : chiffrement en mode flux (un fichier à la fois, \
+pic $(seal_human_bytes "$biggest"))."
+    log_info "Archive en flux : le dossier chiffré sera un répertoire (pas une archive .tar.gz)."
+  else
+    log_info "Archive unique prévue ($(seal_human_bytes "$need"), $(seal_human_bytes "$avail") \
+disponibles sur la destination)."
+  fi
+
+  # Les invites vont sur stderr, le mot de passe revient sur stdout.
+  pw="$(seal_read_password)" || return 1
+  [ -n "$pw" ] || { seal_incident "Mot de passe non obtenu - scellement annulé. Version claire CONSERVÉE."; return 1; }
+
+  seal_log="$(mktemp)"
+  enc="$(seal_dest_path "$dir" archive)"
+  streamdir="$(seal_dest_path "$dir" stream)"
+
+  if [ "$mode" = "archive" ]; then
+    log_info "Chiffrement AES-256 en cours ($dir -> $enc)..."
+    # pipefail : un échec de tar NE DOIT PAS être masqué par le statut d'openssl
+    # (sinon archive tronquée considérée comme valide).
+    if ! ( set -o pipefail
+           tar cf - -C "$(dirname "$dir")" "$(basename "$dir")" 2>>"$seal_log" \
+         | gzip -1 2>>"$seal_log" \
+         | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 \
+               -pass "pass:$pw" -out "$enc" 2>>"$seal_log" ); then
+      [ -s "$seal_log" ] && { log_err "Détails :"; tail -n 5 "$seal_log" >&2; }
+      seal_incident "Échec du chiffrement (espace disque ?). Version claire CONSERVÉE : $dir"
+      rm -f "$enc"
+      rm -f "$seal_log"
+      return 1
+    fi
+    if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "pass:$pw" \
+           -in "$enc" 2>>"$seal_log" | gzip -dc 2>>"$seal_log" | tar tf - >/dev/null 2>>"$seal_log"; then
+      seal_incident "Échec de la VÉRIFICATION du déchiffrement. Version claire CONSERVÉE, \
+archive supprimée : $enc"
+      rm -f "$enc"
+      rm -f "$seal_log"
+      return 1
+    fi
+    local h; h="$(sha256sum "$enc" | awk '{print $1}')"
+    rm -f "$seal_log"
+    custody_log "Preuves scellées par chiffrement : $enc (SHA256 $h) ; clair supprimé."
+    log_ok "Preuves chiffrées et vérifiées : $enc (SHA256 $h)"
+    find "$dir" -type f -exec shred -u -z -n 1 {} \; 2>/dev/null
+    rm -rf "$dir" 2>/dev/null
+    log_ok "Version claire supprimée : $dir (preuves supprimables si besoin)."
+    SEAL_RESULT="$enc"
+    return 0
+  fi
+
+# ---- Mode flux : chaque fichier est chiffré, VÉRIFIÉ, puis son clair est
+  # détruit immédiatement. Le pic d'espace additionnel se limite donc au plus
+  # gros fichier, pas à la taille totale. La vérification est faite avant le
+  # shred : aucune donnée n'est détruite sans avoir été relue et validée.
+  log_info "Chiffrement AES-256 en mode flux ($dir -> $streamdir)..."
+  if [ -e "$streamdir" ] && [ -n "$(ls -A "$streamdir" 2>/dev/null)" ]; then
+    # On ne détruit JAMAIS un dossier chiffré existant : il peut être le seul
+    # reste d'un scellement interrompu (voir le bloc d'échec plus bas).
+    seal_incident "Le dossier chiffré $streamdir existe déjà et n'est pas vide. \
+Refus d'écraser des preuves chiffrées. Traitement annulé, version claire conservée."
+    rm -f "$seal_log"; return 1
+  fi
+  rm -rf "$streamdir"
+  mkdir -p "$streamdir" || {
+    seal_incident "Impossible de créer le dossier chiffré $streamdir. Version claire CONSERVÉE."
+    rm -f "$seal_log"; return 1
+  }
+  local f rel dest want got ok=1 n=0
+  local manifest="$streamdir/MANIFESTE.seal"
+  printf '# MVT-WRAPPER — manifeste de scellement (mode flux)\n' > "$manifest" || {
+    seal_incident "Écriture du manifeste de scellement impossible. Version claire CONSERVÉE."
+    rm -rf "$streamdir" 2>/dev/null; rm -f "$seal_log"; return 1
+  }
+  while IFS= read -r -d '' f; do
+    rel="${f#"$dir"/}"
+    dest="$streamdir/$rel"
+    mkdir -p "$(dirname "$dest")" || { ok=0; break; }
+    # 1. Empreinte de l'original AVANT tout.
+    want="$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+    [ -n "$want" ] || { seal_incident "Empreinte SHA256 impossible sur $rel. Ce fichier reste en clair dans $dir."; ok=0; break; }
+    # 2. Chiffrement.
+    if ! openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 \
+           -pass "pass:$pw" -in "$f" -out "$dest" 2>>"$seal_log"; then
+      seal_incident "Échec du chiffrement de $rel. Ce fichier reste en clair dans $dir."
+      ok=0; break
+    fi
+    # 3. Relecture du chiffré : l'original est-il restitué à l'identique ?
+    got="$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "pass:$pw" \
+            -in "$dest" 2>>"$seal_log" | sha256sum | awk '{print $1}')"
+    if [ -z "$got" ] || [ "$got" != "$want" ]; then
+      seal_incident "Échec de la VÉRIFICATION du déchiffrement de $rel. \
+Le dossier chiffré est CONSERVÉ : $streamdir"
+      rm -f "$dest" 2>/dev/null
+      ok=0; break
+    fi
+    # 4. Vérifié : on peut détruire le clair et le consigner au manifeste.
+    printf '%s  ./%s\n' "$want" "$rel" >> "$manifest"
+    shred -u -z -n 1 "$f" 2>/dev/null
+    n=$(( n + 1 ))
+    if [ $(( n % 200 )) -eq 0 ]; then
+      printf '\r  Chiffrement vérifié : %s fichiers...' "$n" >&2
+    fi
+  done < <(find "$dir" -type f -print0 2>/dev/null)
+  printf '\r%60s\r' '' >&2
+
+  # ÉCHEC APRÈS CHIFFREMENT : on NE SUPPRIME PAS $streamdir. Les fichiers
+  # déjà chiffrés + vérifiés ont eu leur clair shredé : c'est désormais la
+  # SEULE copie restante. Le rm -rf d'origine détruisait les preuves, et le
+  # message annonçait à tort « version claire conservée » alors que les
+  # fichiers précédents venaient d'être détruits.
+  if [ "$ok" -ne 1 ]; then
+    [ -s "$seal_log" ] && { log_err "Détails :"; tail -n 5 "$seal_log" >&2; }
+    if [ "$n" -gt 0 ]; then
+      log_err "SCELLEMENT INCOMPLET : $n fichier(s) déjà chiffrés, vérifiés puis"
+      log_err "détruits en clair. Leur version chiffrée est INTACTE :"
+      log_err "  $streamdir"
+      log_err "Le dossier source $dir est INCOMPLET (fichiers restants en clair)."
+      log_err "Relancez le scellement sur $dir pour finir le travail, ou restaurez"
+      log_err "depuis $streamdir avec le même mot de passe."
+      custody_log "SCELLEMENT INCOMPLET (mode flux) : $n fichier(s) chiffrés et vérifiés dans $streamdir ; le reste est encore en clair dans $dir."
+      SEAL_RESULT="$streamdir"
+    else
+      log_err "Échec avant tout chiffrement - dossier chiffré vide supprimé."
+      rm -rf "$streamdir" 2>/dev/null
+      log_info "Version claire conservée : $dir"
+    fi
+    rm -f "$seal_log"
+    return 1
+  fi
+  # En-tête du manifeste complété une fois le compte connu.
+  printf '# %s fichier(s) chiffré(s), SHA256 des originaux (avant chiffrement)\n' "$n" >> "$manifest"
+
+  rm -f "$seal_log"
+  custody_log "Preuves scellées par chiffrement (mode flux) : $streamdir ($n fichier(s) chiffrés, vérifiés un par un, puis clairs détruits ; MANIFESTE.seal fourni)."
+  log_ok "Preuves chiffrées et vérifiées : $streamdir ($n fichiers)"
   rm -rf "$dir" 2>/dev/null
   log_ok "Version claire supprimée : $dir (preuves supprimables si besoin)."
+  SEAL_RESULT="$streamdir"
+  return 0
 }
 
 # Décision analyste : déverrouille (chattr -i / chmod a-w) puis supprime les preuves.
 # $1 = chemin du dossier ; mot de passe requis si scellé par chiffrement.
+# Gère les deux dispositions produites par seal_encrypted() :
+#   - archive unique  <dossier>.aes256.tar.gz
+#   - dossier chiffré <dossier>.aes256.d/ (mode flux, un fichier chiffré par fichier)
 unseal_and_delete() {
-  local dir="$1" pw
-  [ -d "$dir" ] || { log_err "Dossier introuvable : $dir"; return 1; }
-  if [ -f "$dir.aes256.tar.gz" ]; then
-    printf 'Mot de passe de scellement pour SUPPRIMER les preuves : ' >&2
-    IFS= read -r -s pw || return 1
-    echo >&2
-    if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "pass:$pw" \
-           -in "$dir.aes256.tar.gz" 2>/dev/null | tar tz >/dev/null 2>&1; then
-      log_err "Mot de passe incorrect - suppression refusée."
+  local dir="$1" pw streamdir enc
+  streamdir="$(seal_dest_path "$dir" stream)"
+  enc="$(seal_dest_path "$dir" archive)"
+  # L'archive peut avoir été produite sur un autre FS (SEAL_DEST).
+  [ -f "$dir.aes256.tar.gz" ] && enc="$dir.aes256.tar.gz"
+
+  if [ -f "$enc" ]; then
+    if [ ! -t 0 ]; then
+      log_err "Suppression refusée : aucun terminal pour saisir le mot de passe de scellement."
       return 1
     fi
-    rm -f "$dir.aes256.tar.gz" 2>/dev/null
+    printf 'Mot de passe de scellement pour SUPPRIMER les preuves : ' >&2
+    IFS= read -r -s pw || { echo >&2; log_err "Saisie interrompue - suppression refusée."; return 1; }
+    echo >&2
+    # pipefail : un déchiffrement valide doit produire un tar lisible EN ENTIER.
+    if ! ( set -o pipefail
+           openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "pass:$pw" \
+             -in "$enc" 2>/dev/null \
+         | gzip -dc 2>/dev/null \
+         | tar tf - >/dev/null 2>&1 ); then
+      log_err "Mot de passe incorrect ou archive illisible - suppression refusée."
+      return 1
+    fi
+    rm -f "$enc" 2>/dev/null
+  elif [ -d "$streamdir" ]; then
+    # Mode flux : on vérifie le déchiffrement d'un échantillon face au manifeste.
+    if [ ! -t 0 ]; then
+      log_err "Suppression refusée : aucun terminal pour saisir le mot de passe de scellement."
+      return 1
+    fi
+    printf 'Mot de passe de scellement pour SUPPRIMER les preuves : ' >&2
+    IFS= read -r -s pw || { echo >&2; log_err "Saisie interrompue - suppression refusée."; return 1; }
+    echo >&2
+    local sample f rel want got bad=0
+    sample="$(find "$streamdir" -type f ! -name 'MANIFESTE.seal' 2>/dev/null | head -3)"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      rel="${f#"$streamdir"/}"
+      want="$(awk -v k="./$rel" '$2 == k {print $1}' "$streamdir/MANIFESTE.seal" 2>/dev/null | head -1)"
+      got="$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "pass:$pw" \
+              -in "$f" 2>/dev/null | sha256sum | awk '{print $1}')"
+      [ -n "$want" ] && [ "$got" = "$want" ] || { bad=1; break; }
+    done <<< "$sample"
+    if [ "$bad" -eq 1 ]; then
+      log_err "Mot de passe incorrect ou dossier chiffré illisible - suppression refusée."
+      return 1
+    fi
+    rm -rf "$streamdir" 2>/dev/null
   else
+    [ -d "$dir" ] || { log_err "Dossier introuvable : $dir"; return 1; }
     if [ "$(id -u)" = 0 ] && command -v chattr >/dev/null 2>&1; then
       chattr -R -i "$dir" 2>/dev/null
     fi
@@ -436,23 +1102,10 @@ unseal_and_delete() {
 }
 
 # ------------------------------------------------------------------
-# CONSENTEMENT + PÉRIMÈTRE (loi Godfrain - art. 323-1 s. C. pén.)
-# On n'analyse QUE les appareils et comptes de la personne accompagnée,
-# JAMAIS ceux d'un tiers (en particulier d'un agresseur présumé -
-# ce serait un délit Godfrain, pas une preuve). Exigé AVANT chaque
-# acquisition iOS et Android : si refus, on s'arrête là, aucune donnée.
-# ------------------------------------------------------------------
-# CONSENTEMENT + PÉRIMÈTRE (loi Godfrain - art. 323-1 à 323-7 C. pén.)
-# Garde-fou légal : n'analyser QUE les appareils et comptes de la personne
-#   $1 = plateforme (iOS / Android)
-#   $2 = nom du dossier d'acquisition
-# ------------------------------------------------------------------
-
-# ------------------------------------------------------------------
 # Consentement et périmètre (loi Godfrain - art. 323-1 à 323-7 C. pén.)
 # Garde-fou légal : n'analyser QUE les appareils et comptes de la personne
-# accompagnée, JAMAIS ceux d'un tiers (ni d'un agresseur présumé). 
-# Refus de confirmation => acquisition abandonnée, aucun octet collecté.
+# accompagnée, JAMAIS ceux d'un tiers (ni d'un agresseur présumé).
+# Refus de confirmation => return 1, acquisition abandonnée sans collecte.
 #   $1 = plateforme (iOS / Android)
 # ------------------------------------------------------------------
 confirm_consent_and_scope() {
@@ -463,11 +1116,14 @@ confirm_consent_and_scope() {
   log_warn "Cet outil n'analyse QUE les appareils et comptes DE LA PERSONNE ACCOMPAGNÉE, avec son consentement, dans le seul cadre de l'aide."
   echo ""
   if ask_yesno "Confirmez-vous que CET appareil (et ses éventuels comptes), vous appartient ou appartiennent à la personne accompagnée, dans le strict cadre de son accompagnement ?" "yes"; then
-    custody_log "Consentement confirmé ($platform)."
+    # shellcheck disable=SC2153 # CASE_ID est un global posé par case_init() (start.sh)
+    custody_log "Consentement confirmé ($platform) — référence du consentement écrit : $CASE_ID (recueilli par ${ANALYST:-$(whoami)}, structure ${STRUCTURE_NAME:-non renseignée})."
     log_ok "Périmètre validé - $platform : appareil de la personne accompagnée."
+    return 0
   else
     custody_log "REFUS de consentement ($platform)"
-    die "Acquisition refusée : Vous devez consentir au cadre légal et confirmer que l'appareil analyser vous appartient."
+    log_warn "Acquisition refusée : le consentement au cadre légal et la confirmation que l'appareil appartient à la personne accompagnée sont requis."
+    return 1
   fi
 }
 
@@ -484,10 +1140,21 @@ quarantine_failed_acquisition() {
   custody_log "Acquisition $platform interrompue - capture partielle NON scellée."
   if [ -d "$dir" ] && [ -n "$(find "$dir" -mindepth 1 2>/dev/null | head -n 1)" ]; then
     chmod -R u+w "$dir" 2>/dev/null
+    # Nom anti-collision : une reprise du même CASE_ID aurait déjà créé
+    # « -QUARANTAINE_non-scellée » ; ne jamais écraser une quarantaine.
     quarantine="$dir-QUARANTAINE_non-scellée"
+    if [ -e "$quarantine" ]; then
+      quarantine="$quarantine-$(date '+%Y%m%d-%H%M%S')"
+    fi
     if mv "$dir" "$quarantine" 2>/dev/null; then
+      # Le journal de traçabilité suit le dossier : il pointe vers le nouvel
+      # emplacement pour continuer à tracer dans la capture isolée.
+      [ -n "${CUSTODY_FILE:-}" ] && CUSTODY_FILE="$quarantine/$(basename "$CUSTODY_FILE")"
+      [ -n "${AUDIT_FILE:-}" ] && AUDIT_FILE="$quarantine/$(basename "$AUDIT_FILE")"
       log_warn "Capture partielle isolée : $(basename "$quarantine") - son SHA256 n'engage pas une preuve scellée."
       custody_log "Capture partielle isolée dans $quarantine (non scellée, non reprise)."
+    else
+      log_err "Impossible de déplacer la capture partielle vers $quarantine - elle reste à $(basename "$dir") (à traiter manuellement)."
     fi
   fi
 }
@@ -522,24 +1189,9 @@ build_stix2_env() {
 # Résumé JSON des détections (_detected.json) via python3
 # ------------------------------------------------------------------
 json_summary() {
-  python3 - "$1" <<'PY'
+  PYTHONPATH="$WRAPPER_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" python3 - "$1" <<'PY'
 import json, sys
-
-def pick(d, keys):
-    if isinstance(d, dict):
-        for k in keys:
-            if k in d and d[k] not in (None, ""):
-                return d[k]
-        for v in d.values():
-            r = pick(v, keys)
-            if r not in (None, ""):
-                return r
-    elif isinstance(d, list):
-        for v in d:
-            r = pick(v, keys)
-            if r not in (None, ""):
-                return r
-    return None
+from jsonutils import search
 
 PRIO = ["name", "title", "entry", "value", "package", "uid",
         "artistName", "bundleShortVersionString", "bundleVersion",
@@ -602,16 +1254,26 @@ print(f"    {len(data)} enregistrement(s) correspondant à un IoC :")
 for n, rec in enumerate(data[:MAX], 1):
     if not isinstance(rec, dict):
         continue
-    sev = str(pick(rec, ("level", "severity")) or "n/a").upper()
+    sev = str(search(rec, ("level", "severity")) or "n/a").upper()
     if sev not in LEVELS:
         sev = "n/a"
-    msg = str(pick(rec, ("message", "description", "artifact")) or "n/a")
+    msg = str(search(rec, ("message", "description", "artifact")) or "n/a")
     ioc_line = ""
+    sw_tag = ""
     ioc = rec.get("matched_indicator")
     if isinstance(ioc, dict):
         v = ioc.get("value") or "n/a"
         t = ioc.get("type") or ""
         c = ioc.get("name") or ioc.get("stix2_file_name") or ""
+        sw = ioc.get("is_stalkerware")
+        if sw is True:
+            sw_tag = "  [SPYWARE AVERE]"
+        elif sw is False:
+            sw_tag = "  [USAGE DOUBLE LEGITIME A CORROBORER]"
+        else:
+            low = (str(c) + " " + str(v)).lower()
+            if "stalkerware" in low:
+                sw_tag = "  [SPYWARE AVERE - collection dédiée]"
         ioc_line = f"        IoC : {v}"
         if t:
             ioc_line += f"  (type: {t})"
@@ -620,13 +1282,13 @@ for n, rec in enumerate(data[:MAX], 1):
     elif isinstance(ioc, str) and ioc:
         ioc_line = f"        IoC : {ioc}"
     else:
-        v = pick(rec, ("value", "indicator", "matched_indicator_value"))
+        v = search(rec, ("value", "indicator", "matched_indicator_value"))
         if v not in (None, ""):
             ioc_line = f"        IoC : {str(v)[:160]}"
     ctx = evfmt(rec.get("event"))
     print(f"    {n}) [{sev}] {msg[:220]}")
     if ioc_line:
-        print(ioc_line)
+        print(ioc_line + sw_tag)
     if ctx:
         print(f"        Détails : {ctx}")
 if len(data) > MAX:
@@ -706,35 +1368,21 @@ module_desc() {
 # ------------------------------------------------------------------
 device_info_from() {
   local dir="$1"
-  python3 - "$dir" <<'PY'
+  PYTHONPATH="$WRAPPER_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" python3 - "$dir" <<'PY'
 import json, os, re, sys
+from jsonutils import search
 root = sys.argv[1]
-def dig(d, keys):
-    if isinstance(d, dict):
-        for k in keys:
-            if k in d and d[k] not in (None, ""):
-                return d[k]
-        for v in d.values():
-            r = dig(v, keys)
-            if r not in (None, ""):
-                return r
-    elif isinstance(d, list):
-        for v in d:
-            r = dig(v, keys)
-            if r not in (None, ""):
-                return r
-    return None
 parts = []
 for name in ("backup_info.json", "sysdiagnose_info.json"):
     p = os.path.join(root, name)
     if os.path.isfile(p):
         try:
             d = json.load(open(p, encoding="utf-8"))
-            model  = dig(d, ("product_type", "product", "devicemodel", "model"))
-            ver    = dig(d, ("product_version", "ios_version", "version"))
-            dname  = dig(d, ("device_name", "name"))
-            imei   = dig(d, ("imei",))
-            serial = dig(d, ("serial_number", "serialNumber", "SerialNumber"))
+            model  = search(d, ("product_type", "product", "devicemodel", "model"))
+            ver    = search(d, ("product_version", "ios_version", "version"))
+            dname  = search(d, ("device_name", "name"))
+            imei   = search(d, ("imei",))
+            serial = search(d, ("serial_number", "serialNumber", "SerialNumber"))
             if dname: parts.append(f"Nom: {dname}")
             if model: parts.append(f"Modèle: {model}")
             if ver:   parts.append(f"OS: {ver}")
@@ -745,17 +1393,47 @@ for name in ("backup_info.json", "sysdiagnose_info.json"):
         if parts:
             break
 if not parts:
+    p = os.path.join(root, "Info.plist")
+    if os.path.isfile(p):
+        try:
+            import base64, plistlib
+            def maybe_b64(v):
+                if not isinstance(v, str):
+                    return v
+                s = v.strip()
+                if not s or len(s) % 4:
+                    return v
+                try:
+                    raw = base64.b64decode(s, validate=True)
+                    text = raw.decode("utf-8", "strict")
+                except Exception:
+                    return v
+                if (text.isprintable()
+                        and base64.b64encode(raw).decode("ascii").rstrip("=") == s.rstrip("=")):
+                    return text
+                return v
+            with open(p, "rb") as fh:
+                d = plistlib.load(fh)
+            for k, l in (("Device Name", "Nom"), ("Product Type", "Modèle"),
+                         ("Product Version", "OS"), ("IMEI", "IMEI"),
+                         ("Serial Number", "Serial"), ("Unique Device ID", "UDID")):
+                v = maybe_b64(d.get(k))
+                if v not in (None, "", "unavailable"):
+                    parts.append(f"{l}: {v}")
+        except Exception:
+            pass
+if not parts:
     p = os.path.join(root, "acquisition.json")
     if os.path.isfile(p):
         try:
             d = json.load(open(p, encoding="utf-8"))
-            model  = dig(d, ("product_model", "model", "device_model"))
-            ver    = dig(d, ("device_version", "android_version", "version", "os_version"))
-            manuf  = dig(d, ("product_manufacturer", "manufacturer", "brand"))
-            imei   = dig(d, ("imei", "imei1", "Imei"))
-            serial = dig(d, ("serial_number", "serial", "Serial"))
+            model  = search(d, ("product_model", "model", "device_model"))
+            ver    = search(d, ("device_version", "android_version", "version", "os_version"))
+            manuf  = search(d, ("product_manufacturer", "manufacturer", "brand"))
+            imei   = search(d, ("imei", "imei1", "Imei"))
+            serial = search(d, ("serial_number", "serial", "Serial"))
             if not serial:
-                adb = dig(d, ("collector", "Adb"))
+                adb = search(d, ("collector", "Adb"))
                 if isinstance(adb, dict):
                     serial = adb.get("Serial")
             if model:  parts.append(f"Modèle: {model}")
@@ -780,7 +1458,7 @@ if not parts:
                     parts.append(f"{label}: {m.group(2)}")
         except Exception:
             pass
-  print(" ; ".join(parts))
+print(" ; ".join(parts))
 PY
 }
 
@@ -793,30 +1471,15 @@ PY
 extract_device_details() {
   local dir="$1"; shift
   local extra_args=("$@")
-  python3 - "$dir" "${extra_args[@]}" <<'PY'
-import base64, json, os, re, sys
+  PYTHONPATH="$WRAPPER_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" python3 - "$dir" "${extra_args[@]}" <<'PY'
+import base64, json, os, plistlib, re, sys
+from jsonutils import search
 root = sys.argv[1]
 overrides = {}
 for a in sys.argv[2:]:
     if "=" in a:
         k, v = a.split("=", 1)
         overrides[k] = v
-
-def dig(d, keys):
-    if isinstance(d, dict):
-        for k in keys:
-            if k in d and d[k] not in (None, ""):
-                return d[k]
-        for v in d.values():
-            r = dig(v, keys)
-            if r not in (None, ""):
-                return r
-    elif isinstance(d, list):
-        for v in d:
-            r = dig(v, keys)
-            if r not in (None, ""):
-                return r
-    return None
 
 def fmt_storage(val):
     if val is None:
@@ -902,7 +1565,7 @@ def human_model(code, brand):
         return None
     c = str(code).split("/")[0].strip()
     if c in APPLE_MODELS:
-        return APPLE_MODELS[c] if c.lower().startswith("iphone") else APPLE_MODELS[c]
+        return APPLE_MODELS[c]
     if c in SAMSUNG_MODELS:
         return SAMSUNG_MODELS[c]
     if c.upper().startswith("SM-"):
@@ -925,6 +1588,42 @@ result = {k: (overrides.get({
 model_code = overrides.get("ModelCode") or None
 platform = overrides.get("Platform")
 
+# --- Source iOS : plists d'une backup iTunes (Info.plist / Manifest.plist) ---
+for name in ("Info.plist", "Manifest.plist"):
+    pp = os.path.join(root, name)
+    if not os.path.isfile(pp):
+        continue
+    try:
+        with open(pp, "rb") as fh:
+            d = plistlib.load(fh)
+    except Exception:
+        continue
+    if name == "Info.plist":
+        platform = platform or "iOS"
+        model_code = model_code or d.get("Product Type") or d.get("ProductType") or d.get("Device Model")
+        ver = d.get("Product Version") or d.get("ProductVersion") or d.get("iOS Version")
+        build = d.get("Build Version") or d.get("BuildVersion")
+        if ver:
+            result["Systeme d exploitation"] = result["Systeme d exploitation"] or ("iOS " + str(ver))
+        result["Build"] = result["Build"] or build
+        result["Nom de l'appareil"] = result["Nom de l'appareil"] or \
+            d.get("Device Name") or d.get("DeviceName")
+        result["Numero de telephone"] = result["Numero de telephone"] or \
+            d.get("Phone Number") or d.get("PhoneNumber")
+        result["IMEI"] = result["IMEI"] or d.get("IMEI")
+        result["Numero de serie"] = result["Numero de serie"] or \
+            d.get("Serial Number") or d.get("SerialNumber")
+        result["ICCID"] = result["ICCID"] or d.get("ICCID")
+        result["MEID"] = result["MEID"] or d.get("MEID")
+        result["Target identifier"] = result["Target identifier"] or \
+            d.get("Unique Device ID") or d.get("UniqueDeviceID")
+        result["Derniere sauvegarde"] = result["Derniere sauvegarde"] or \
+            d.get("Last Backup Date") or d.get("LastBackupDate")
+        result["Marque"] = result["Marque"] or "Apple"
+    elif name == "Manifest.plist":
+        result["Derniere sauvegarde"] = result["Derniere sauvegarde"] or \
+            d.get("Date") or d.get("LastBackupDate")
+
 # --- Sources iOS (clés PascalCase) ---
 for name in ("backup_info.json", "sysdiagnose_info.json"):
     p = os.path.join(root, name)
@@ -935,26 +1634,26 @@ for name in ("backup_info.json", "sysdiagnose_info.json"):
     except Exception:
         continue
     platform = "iOS"
-    model_code = model_code or dig(d, ("Product Type", "product_type", "ProductType", "model"))
-    ver = dig(d, ("Product Version", "product_version", "ProductVersion", "ios_version"))
-    build = dig(d, ("Build Version", "build_version", "BuildVersion"))
+    model_code = model_code or search(d, ("Product Type", "product_type", "ProductType", "model"))
+    ver = search(d, ("Product Version", "product_version", "ProductVersion", "ios_version"))
+    build = search(d, ("Build Version", "build_version", "BuildVersion"))
     if ver:
         result["Systeme d exploitation"] = result["Systeme d exploitation"] or ("iOS " + str(ver))
     result["Build"] = result["Build"] or build
     result["Nom de l'appareil"] = result["Nom de l'appareil"] or \
-        b64name(dig(d, ("Display Name",)) or "") or dig(d, ("Device Name", "device_name", "name", "Devicename"))
+        b64name(search(d, ("Display Name",)) or "") or search(d, ("Device Name", "device_name", "name", "Devicename"))
     result["Numero de telephone"] = result["Numero de telephone"] or \
-        dig(d, ("Phone Number", "phone_number", "PhoneNumber"))
-    result["IMEI"] = result["IMEI"] or dig(d, ("IMEI", "imei"))
+        search(d, ("Phone Number", "phone_number", "PhoneNumber"))
+    result["IMEI"] = result["IMEI"] or search(d, ("IMEI", "imei"))
     result["Numero de serie"] = result["Numero de serie"] or \
-        dig(d, ("Serial Number", "serial_number", "SerialNumber", "Serial"))
-    result["ICCID"] = result["ICCID"] or dig(d, ("ICCID", "iccid"))
-    result["MEID"] = result["MEID"] or dig(d, ("MEID", "meid"))
+        search(d, ("Serial Number", "serial_number", "SerialNumber", "Serial"))
+    result["ICCID"] = result["ICCID"] or search(d, ("ICCID", "iccid"))
+    result["MEID"] = result["MEID"] or search(d, ("MEID", "meid"))
     result["Target identifier"] = result["Target identifier"] or \
-        dig(d, ("Target Identifier", "target_identifier", "Unique Identifier", "unique_identifier"))
+        search(d, ("Target Identifier", "target_identifier", "Unique Identifier", "unique_identifier"))
     result["Derniere sauvegarde"] = result["Derniere sauvegarde"] or \
-        dig(d, ("Last Backup Date", "last_backup_date", "LastBackupDate"))
-    apps = dig(d, ("Installed Applications", "installed_applications"))
+        search(d, ("Last Backup Date", "last_backup_date", "LastBackupDate"))
+    apps = search(d, ("Installed Applications", "installed_applications"))
     if isinstance(apps, list) and apps:
         result["Applications installees"] = result["Applications installees"] or f"{len(apps)} application(s)"
     result["Marque"] = result["Marque"] or "Apple"
@@ -969,16 +1668,16 @@ if platform != "iOS":
         except Exception:
             d = {}
         platform = "Android"
-        model_code = model_code or dig(d, ("product_model", "model", "device_model"))
-        ver = dig(d, ("device_version", "android_version", "version", "os_version"))
+        model_code = model_code or search(d, ("product_model", "model", "device_model"))
+        ver = search(d, ("device_version", "android_version", "version", "os_version"))
         if ver:
             result["Systeme d exploitation"] = result["Systeme d exploitation"] or ("Android " + str(ver))
         result["Marque"] = result["Marque"] or \
-            dig(d, ("product_manufacturer", "manufacturer", "brand"))
-        result["IMEI"] = result["IMEI"] or dig(d, ("imei", "imei1", "Imei"))
-        serial = result["Numero de serie"] or dig(d, ("serial_number", "serial", "Serial"))
+            search(d, ("product_manufacturer", "manufacturer", "brand"))
+        result["IMEI"] = result["IMEI"] or search(d, ("imei", "imei1", "Imei"))
+        serial = result["Numero de serie"] or search(d, ("serial_number", "serial", "Serial"))
         if not serial:
-            adb = dig(d, ("collector", "Adb"))
+            adb = search(d, ("collector", "Adb"))
             if isinstance(adb, dict):
                 serial = adb.get("Serial")
         result["Numero de serie"] = result["Numero de serie"] or serial
@@ -1070,7 +1769,7 @@ try:
                    if f.endswith("_detected.json") and os.path.isfile(os.path.join(root, f)))
 except OSError:
     sys.exit(0)
-tot, bylev, bymod = 0, defaultdict(int), {}
+tot, bylev, bymod, sw_tot = 0, defaultdict(int), {}, 0
 for fn in files:
     try:
         data = json.load(open(os.path.join(root, fn), encoding="utf-8"))
@@ -1087,12 +1786,15 @@ for fn in files:
             lev = "INFO"
         tot += 1
         bylev[lev] += 1
+        if isinstance(rec.get("matched_indicator"), dict) and rec["matched_indicator"].get("is_stalkerware") is True:
+            sw_tot += 1
         if mod not in bymod:
             bymod[mod] = [0, ""]
         bymod[mod][0] += 1
         if not bymod[mod][1] or order[lev] > order[bymod[mod][1]]:
             bymod[mod][1] = lev
 print(f"total|{tot}")
+print(f"stalkerware|{sw_tot}")
 for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
     print(f"level|{k}|{bylev.get(k, 0)}")
 for mod, (c, mx) in sorted(bymod.items()):
@@ -1100,15 +1802,15 @@ for mod, (c, mx) in sorted(bymod.items()):
 PY
 }
 
-# Bloc de synthèse (ligne de verdict) inséré en tête du rapport.
-# $1 = dossier d'analyse
+# Bloc de synthèse/verdict inséré en tête du rapport.
 detection_synthesis() {
   local results="$1"
-  local tot=0 c_crit=0 c_high=0 c_med=0 c_low=0 c_info=0 mods=0
+  local tot=0 c_crit=0 c_high=0 c_med=0 c_low=0 c_info=0 mods=0 c_sw=0
   local t a b verdict
   while IFS='|' read -r t a b; do
     case "$t" in
       total) tot="$a" ;;
+      stalkerware) c_sw="$a" ;;
       level) case "$a" in
                CRITICAL) c_crit="$b" ;;
                HIGH)     c_high="$b" ;;
@@ -1121,7 +1823,7 @@ detection_synthesis() {
   done < <(detection_stats "$results")
 
   if [ "$tot" -le 0 ]; then
-    verdict="AUCUNE détection d'IoC - preuve a priori saine (à confirmer)."
+    verdict="AUCUNE détection d'IoC - preuve à priori saine (à confirmer)."
   elif [ "$c_crit" -gt 0 ]; then
     verdict="CRITIQUE - indicateurs de niveau maximal détectés : compromission hautement probable, investigation immédiate requise."
   elif [ "$c_high" -gt 0 ]; then
@@ -1135,14 +1837,15 @@ detection_synthesis() {
   echo '--------------------------------------------------------------'
   echo "  SYNTHESE DE L'ANALYSE"
   echo '--------------------------------------------------------------'
-  echo "  Detections            : $tot"
-  echo "  Repartition severite  : CRITICAL: $c_crit | HIGH: $c_high | MEDIUM: $c_med | LOW: $c_low | INFO: $c_info"
-  echo "  Modules concernes     : $mods"
+  echo "  Détections            : $tot"
+  [ "$c_sw" -gt 0 ] && echo "  dont spyware avérés  : $c_sw"
+  echo "  Répartition séverite  : CRITICAL: $c_crit | HIGH: $c_high | MEDIUM: $c_med | LOW: $c_low | INFO: $c_info"
+  echo "  Modules concernés     : $mods"
   echo "  Verdict               : $verdict"
   echo ""
 }
 
-# Liste propre des IoCs utilisés (basename, dédupliqués) depuis info.json.
+# Liste propre des IoCs utilisés
 iocs_csv_from_results() {
   local results="$1"
   [ -f "$results/info.json" ] || { printf '%s' "${2:-}"; return 0; }
@@ -1158,10 +1861,79 @@ except Exception:
 PY
 }
 
+# Convertit un rapport texte (rapport.txt) en PDF, 100 % python stdlib
+# (aucune dépendance : pas de LibreOffice/pandoc/reportlab). Police base-14
+# Courier /WinAnsiEncoding : les glyphes hors CP1252 (═, ↑, …) sont
+# translittérés en ASCII équivalents.
+rapport_to_pdf() {
+  local txt="${1:-}" pdf="${2:-}"
+  [ -f "$txt" ] || return 1
+  [ -n "$pdf" ] || return 1
+  command -v python3 >/dev/null 2>&1 || { log_err "python3 requis pour le PDF du rapport."; return 1; }
+  python3 - "$txt" "$pdf" <<'PDFPY' || { log_err "Échec de la génération PDF du rapport."; return 1; }
+import sys
+txt, pdf = sys.argv[1], sys.argv[2]
+text = open(txt, encoding="utf-8").read()
+trans = str.maketrans({
+    "═": "=", "─": "-", "│": "|", "┌": "+", "┐": "+", "└": "+", "┘": "+",
+    "├": "+", "┤": "+", "┬": "+", "┴": "+", "┼": "+",
+    "↑": "^", "↓": "v", "≥": ">=", "✔": "+", "•": "*", "✓": "v",
+})
+text = text.translate(trans).encode("cp1252", "replace")
+
+W = 92          # largeur max utile (Courier 9pt, A4, marges 46pt)
+LPP = 64        # lignes de corps par page
+FONT = "/F1 9 Tf"
+WIDTH, HEIGHT = 595, 842
+LX, TOP = 46, 792
+
+def esc(b):
+    return b.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+
+lines = []
+for raw in text.split(b"\n"):
+    lines.extend(raw[i:i + W] for i in range(0, len(raw) or 1, W))
+pages = [lines[i:i + LPP] for i in range(0, len(lines), LPP)] or [[]]
+
+def content(page, num):
+    out = bytearray(b"BT\n" + FONT.encode() + b"\n1 0 0 1 %d %d Tm\n" % (LX, TOP))
+    for ln in page:
+        out += b"(" + esc(ln) + b") Tj\n0 -11 Td\n"
+    out += b"ET\n"
+    foot = b"Rapport d'analyse MVT-Wrapper - page %d/%d" % (num, len(pages))
+    out += b"BT\n/F1 8 Tf\n1 0 0 1 %d 40 Tm\n(%s) Tj\nET\n" % (LX, esc(foot))
+    return bytes(out)
+
+objs = [b"<< /Type /Catalog /Pages 2 0 R >>"]
+objs.append(b"<< /Type /Pages /Kids [" + b" ".join(b"%d 0 R" % (4 + 2 * i) for i in range(len(pages))) + b"] /Count %d >>" % len(pages))
+objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>")
+for i in range(len(pages)):
+    cont = 5 + 2 * i
+    objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] "
+                b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % (WIDTH, HEIGHT, cont))
+    c = content(pages[i], i + 1)
+    objs.append(b"<< /Length %d >>\nstream\n" % len(c) + c + b"endstream")
+
+out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+offsets = [0]
+for num, o in enumerate(objs, start=1):
+    offsets.append(len(out))
+    out += b"%d 0 obj\n" % num + o + b"\nendobj\n"
+xref = len(out)
+out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+for off in offsets[1:]:
+    out += b"%010d 00000 n \n" % off
+out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+open(pdf, "wb").write(out)
+PDFPY
+  [ -s "$pdf" ] || { log_err "PDF du rapport vide : $pdf"; return 1; }
+  return 0
+}
+
 make_report() {
-  local case_id="$1" results="$2" platform="$3" iocs_csv="${4:-}" evidence_dir="${5:-}" device="${6:-}" analysis_type="${7:-}"
+  local case_id="$1" results="$2" platform="$3" iocs_csv="${4:-}" evidence_dir="${5:-}" analysis_type="${6:-}"
   local report="$results/rapport.txt"
-  local mod desc f nbf
+  local mod desc f
   local det=() files=()
   local evidence_rel=""
   mapfile -t det < <(collect_detected "$results")
@@ -1179,21 +1951,20 @@ make_report() {
     echo "Plateforme       : $platform"
     echo "Type d'analyse   : ${analysis_type:-n/a}"
     echo "Structure        : ${STRUCTURE_NAME:-non renseignée}"
-    echo "Consentement     : consentement écrit recueilli"
+    echo "Consentement     : référence $case_id — consentement écrit recueilli avant analyse par ${ANALYST:-$(whoami)}"
     echo "Versions outil   : wrapper ${VERSION:-n/a} / MVT $(mvt_version_local 2>/dev/null || echo n/a)"
+    echo "Composants       : $(tool_versions)"
+    echo "Machine          : $(hostname 2>/dev/null || uname -n)"
+    echo "Base d'IoCs      : $(ioc_base_signature)"
     echo ""
     echo '--------------------------------------------------------------'
     echo '  STATUT DU RAPPORT'
     echo '--------------------------------------------------------------'
-    echo "  Ce rapport est un élément technique d'aide à l'orientation et non"
-    echo "  une expertise judiciaire au sens du Code de procedure penale."
-    echo "  Il ne se substitue ni à une plainte, ni à une expertise ordonnée par"
-    echo "  la juridiction ou sur requisition (art. 60, 77-1-1 et 156 C. pr. pen)."
+    echo "  Ce rapport est un élément technique d'aide à l'orientation et non une expertise judiciaire au sens du Code de procedure penale."
+    echo "  Il ne se substitue ni à une plainte, ni à une expertise ordonnée par la juridiction ou sur requisition (art. 60, 77-1-1 et 156 C. pr. pen)."
     echo "  Il ne prejuge pas de la decision de justice."
-    echo "  Methode et limites : analyses portant exclusivement sur les appareils"
-    echo "  et comptes de la personne accompagnée avec son consentement ecrit."
-    echo "  Les IoCs publics sont des indicateurs et non une preuve :"
-    echo "  une detection doit être corroborer et peut présenter des faux positifs/negatifs;"
+    echo "  Methode et limites : analyses portant exclusivement sur les appareils et comptes de la personne accompagnée avec son consentement ecrit."
+    echo "  Les IoCs publics sont des indicateurs et non une preuve : une detection doit être corroborer et peut présenter des faux positifs/negatifs;"
     echo ""
     echo '--------------------------------------------------------------'
     echo '  IDENTIFICATION DU DISPOSITIF'
@@ -1220,9 +1991,13 @@ make_report() {
   echo '--------------------------------------------------------------'
   echo '  MENACES / INDICATEURS DE COMPROMISSION DETECTES'
   echo '--------------------------------------------------------------'
-  detection_synthesis "$results"
+  echo '  Niveau de confiance : les détections sont classées par sévérité :'
+  echo '  [CRITICAL/HIGH] = signal fort à investiguer en priorité.'
+  echo '  [SPYWARE AVERE] = indique un rapprochement avec des collections dédiées au logiciel espion.'
+  echo '  [USAGE DOUBLE LEGITIME A CORROBORER] = signale des applications ou services ayant aussi une utilisation licite (système, télémaintenance, accessibilité...).'
+  echo '  Toute détection doit être corroborée.'
   echo ''
-  detection_stats "$results"
+  detection_synthesis "$results"
   echo ''
     if [ "${#det[@]}" -eq 0 ]; then
       echo "  [INFO] Aucune menace correspondant aux IoCs n'a été détectée."
@@ -1254,31 +2029,37 @@ make_report() {
     echo '--------------------------------------------------------------'
     if [ -n "$evidence_dir" ] && [ -d "$evidence_dir" ]; then
       echo "  Dossier de preuve : $evidence_rel"
-      [ -f "$evidence_dir/SHA256SUMS-acquisition.txt" ] && echo "  Manifeste acquisition : $evidence_rel/SHA256SUMS-acquisition.txt"
+      if [ -f "$evidence_dir/SHA256SUMS-acquisition.txt" ]; then
+        echo "  Manifeste acquisition : $evidence_rel/SHA256SUMS-acquisition.txt"
+        echo "  Empreinte (SHA256) acquisition : $(sha256sum "$evidence_dir/SHA256SUMS-acquisition.txt" 2>/dev/null | awk '{print $1}')"
+      fi
       if [ -f "$evidence_dir/SHA256SUMS.txt" ]; then
         if ( cd "$evidence_dir" && sha256sum -c SHA256SUMS.txt >/dev/null 2>&1 ); then
-          echo '  Intégrité (SHA256) : verifiée - OK'
+          echo '  Intégrité finale (SHA256) : verifiée - OK'
         else
-          echo '  Intégrité (SHA256) : À CONTRÔLER (anomalie detectée !)'
+          echo '  Intégrité finale (SHA256) : À CONTRÔLER (anomalie detectée !)'
         fi
+        echo "  Empreinte (SHA256) manifeste final : $(sha256sum "$evidence_dir/SHA256SUMS.txt" 2>/dev/null | awk '{print $1}')"
+        echo "  Manifeste horodaté : $(head -n 1 "$evidence_dir/SHA256SUMS.txt" 2>/dev/null)"
       fi
-      [ -f "$evidence_dir/chain_of_custody.txt" ] && echo "  Journal de traçabilité : $evidence_rel/chain_of_custody.txt"
+      [ -f "$evidence_dir/chain_of_custody.txt" ] && echo "  Journal de traçabilité : $evidence_rel/chain_of_custody.txt — ${ANALYST:-$(whoami)} / ${STRUCTURE_NAME:-non renseignée}"
     else
       echo '  n/a'
     fi
     echo ''
-    echo "Note : une détection d'IoC ne signifie pas automatiquement que le"
-    echo 'dispositif est compromis ; les IoCs publics seuls ne suffisent pas à'
-    echo 'conclure. Chaque détection doit être investiguée par un analyste.'
-    echo "Preservation avant remediation : aucune action de remediation (dont"
-    echo "la desinstallation d'un logiciel espion) n'engage la securite d'etre"
-    echo "techniquement realisee sur ce terminal a ce stade."
-    echo 'Orientation : 3919 (violences au sein du couple), 116 006 (France'
-    echo 'Victimes), Cybermalveillance.gouv.fr, CNIL (le-chatelier.cyberstalking),'
-    echo 'et un constat par commissaire de justice peut etre envisage.'
+    echo "  Note : une détection d'IoC ne signifie pas automatiquement que le dispositif est compromis ; les IoCs publics seuls ne suffisent pas à conclure."
+    echo '  Chaque détection doit être investiguée par un analyste.'
+    echo "  Preservation avant remediation : aucune action de remediation (dont la desinstallation d'un logiciel espion) n'engage la securite d'etre techniquement realisee sur ce terminal a ce stade."
+    echo '  Orientation : 3919 (violences au sein du couple), 116 006 (France Victimes), Cybermalveillance.gouv.fr, CNIL, et un constat par commissaire de justice peut être envisagé.'
+    echo ''
     echo '══════════════════════════════════════════════════════════'
   } > "$report"
   log_ok "Rapport généré : $report"
+  if rapport_to_pdf "$report" "$results/rapport.pdf"; then
+    log_ok "Rapport PDF : $results/rapport.pdf"
+  else
+    log_warn "Rapport PDF non généré (moteur Python indisponible/échec)."
+  fi
 
   if [ "${#det[@]}" -eq 0 ]; then
     log_ok "Résultat de l'analyse : aucune détection d'IoC."
@@ -1294,23 +2075,8 @@ make_report() {
   hline
 }
 
-triage_passif_tinycheck() {
-  local platform="$1"
-  custody_log "Triage passif ($platform) : TinyCheck non-invasif sur les flux de la personne accompagnée."
-  if [ -n "${TINYCHECK_BIN:-}" ] && [ -x "${TINYCHECK_BIN:?}" ]; then
-    log_ok "TinyCheck présent ($TINYCHECK_BIN) - triage passif sur point d'accès instrumenté."
-    custody_log "Triage passif TinyCheck ($platform) : point d'accès instrumenté, aucun octet du terminal touché."
-  else
-    log_warn "TinyCheck non installé - triage passif à concevoir avec cet outil (méthodologie phase 1)."
-    custody_log "Triage passif ($platform) : TinyCheck absent - limitation documentée, aucune donnée invasive."
-  fi
-  return 0
-}
-
 # ------------------------------------------------------------------
-# Volet orientation et accompagnement (checklist consentement RGPD)
-# Après l'acquisition : numéros visibles, orientation judiciaire (consentement
-# écrit requis préalablement), réorientation loi Godfrain rappelée. Journalisé.
+# Volet orientation et accompagnement
 orientation_accompagnement() {
   local platform="$1"
   log_info "Orientation et accompagnement proposés ($platform)."
@@ -1318,18 +2084,13 @@ orientation_accompagnement() {
   echo '--------------------------------------------------------------'
   echo '  ORIENTATION ET ACCOMPAGNEMENT '
   echo '--------------------------------------------------------------'
-  echo '  3919        : violences au sein du couple (info, écoute, orientation)'
-  echo '  116 006     : France Victimes - aide aux victimes (7j/7)'
+  echo '  3919 : violences au sein du couple (info, écoute, orientation)'
+  echo '  116 006 : France Victimes - aide aux victimes (7j/7)'
   echo '  Hubertine Auclert : centre Hubertine Auclert (Île-de-France)'
-  echo '  CNIL        : le-chatelier.cyberstalking (CNIL)'
   echo '  Cybermalveillance : Cybermalveillance.gouv.fr'
-  echo '  Asso Echap  : github.com/AssoEchap/stalkerware-indicators'
   echo '  Commissaire de justice : constat opposable (préservation)'
-  echo '  Plainte     : dépôt de plainte / main courante en brigade (3919)'
+  echo '  Plainte : dépôt de plainte / main courante en brigade (3919)'
   echo ''
-  echo '  Préservation avant remédiation : la désinstallation notifie'
-  echo "  l'agresseur et détruit la preuve - aucune remédiation n'est"
-  echo '  engagée avant scellage et plainte.'
   echo '--------------------------------------------------------------'
   custody_log "Accompagnement proposé ($platform) : 3919, 116 006, Centre Hubertine Auclert, CNIL, Cybermalveillance, Echap, commissaire de justice."
   return 0

@@ -1,4 +1,6 @@
-reports/
 DOCS_Accompagnement/
 evidence/
 config.sh
+.env
+__pycache__/
+.opencode/
