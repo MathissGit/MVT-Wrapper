@@ -4,3 +4,4 @@ config.sh
 .env
 __pycache__/
 .opencode/
+tests/

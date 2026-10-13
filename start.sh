@@ -5,10 +5,11 @@
 #      - lancer une analyse (iOS / Android)
 #      - gérer les IoCs (fichier, URL, dépôt git, mise à jour)
 #      - Configuration 
+#      - consulter une archive scellée (déchiffrement temporaire)
 #      - vérifier / installer les dépendances
 #   . sous-commandes pour un usage direct :
 #      start.sh analyse | iocs | update-iocs | add | add-repo
-#      list-iocs | env-iocs | install | purge | help
+#      list-iocs | env-iocs | install | open | purge | help
 # ============================================================
 
 set -u
@@ -18,27 +19,51 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 mkdir -p "$EVIDENCE_DIR" "$IOCS_CUSTOM_DIR" "$IOCS_MANAGED_DIR" "$TOOLS_DIR"
 
+# ------------------------------------------------------------------
+# Dossiers temporaires de consultation (cmd_open) : ils sont supprimés
+# automatiquement à la sortie du wrapper (Quitter, Ctrl-C, Ctrl-D,
+# fermeture du terminal). En mode CLI, cmd_open bloque puis laisse la
+# sortie déclencher le nettoyage.
+# ------------------------------------------------------------------
+MENU_MODE=0
+OPEN_TMPS=()
+register_open_tmp() { [ -n "${1:-}" ] && OPEN_TMPS+=("$1"); return 0; }
+cleanup_open_temps() {
+  local d
+  [ "${#OPEN_TMPS[@]}" -eq 0 ] && return 0
+  for d in ${OPEN_TMPS[@]+"${OPEN_TMPS[@]}"}; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
+    chmod -R u+w "$d" 2>/dev/null || true
+    rm -rf "$d" 2>/dev/null || true
+  done
+  OPEN_TMPS=()
+  return 0
+}
+trap 'cleanup_open_temps' EXIT
+trap 'cleanup_open_temps; exit 130' INT
+trap 'cleanup_open_temps; exit 143' TERM
+trap 'cleanup_open_temps; exit 129' HUP
+
 usage() {
   cat <<'EOF'
 Usage : ./start.sh [commande] [options]
 
   (sans commande)        Affiche le menu principal interactif
-  menu                   Idem
+  menu                   Affiche le menu principal interactif
   analyse                Lance le flux d'analyse (IoCs + analyse)
-    --no-ioc-update      Ne pas proposer la mise à jour des IoCs
-    --analyst "Nom"      Nom indiqué dans le rapport
+    --no-ioc-update       - Ne pas proposer la mise à jour des IoCs
+    --analyst "Nom"       - Nom indiqué dans le rapport
   iocs                   Ouvre le menu de gestion des IoCs
   update-iocs            Met à jour les IoCs (repos git + officiels)
   add <fichier|URL>      Ajoute un fichier d'IoC ou une URL distante
   add-repo <URL-git>     Ajoute un dépôt git et le synchronise
   list-iocs              Liste les fichiers IoCs chargés
   env-iocs               Affiche la variable MVT_STIX2
-  config                 Ouvre le menu de configuration (VirusTotal, verrou,
-                         destination de l'archive chiffrée, analyste)
+  config                 Ouvre le menu de configuration (VirusTotal, verrou, destination de l'archive chiffrée, analyste)
   install                Lance install.sh (dépendances)
   terminal [analyse]     Ouvre dans un terminal dédié (Konsole/WezTerm)
-  purge [CASE-...]       Supprime définitivement une affaire (demande le
-                         mot de passe si les preuves sont chiffrées)
+  open [CASE-...]        Consulte une affaire scellée : déchiffre l'affaire complète vers un dossier temporaire en lecture seule et l'ouvre dans le gestionnaire de fichiers
+  purge [CASE-...]       Supprime définitivement une affaire (double confirmation, sans mot de passe)
   help                   Cette aide
 
 Navigation des menus : flèches ↑/↓ + Entrée pour valider.
@@ -46,7 +71,7 @@ EOF
 }
 
 # ============================================================
-#  PARTIE 1 — GESTION DES IOCS
+#  GESTION DES IOCS
 # ============================================================
 
 # Mise à jour : synchronise les repos git (iocs/managed/) + IoCs officiels.
@@ -192,8 +217,8 @@ PY
 # Liste des bundles IoCs chargés.
 cmd_list() {
   local custom=() managed=() n
-  mapfile -t custom < <(find "$IOCS_CUSTOM_DIR" -type f \( -name '*.stix2' -o -name '*.json' \) 2>/dev/null | LC_ALL=C sort)
-  mapfile -t managed < <(find "$IOCS_MANAGED_DIR" -mindepth 2 -type f \( -name '*.stix2' -o -name '*.json' \) ! -path '*/.git/*' 2>/dev/null | LC_ALL=C sort)
+  mapfile -t custom < <(_ioc_find_in "$IOCS_CUSTOM_DIR")
+  mapfile -t managed < <(_ioc_find_in "$IOCS_MANAGED_DIR")
 
   banner "Bundles IoCs disponibles"
   echo "  • iocs/custom/   (${#custom[@]} fichier(s)) - IoCs local)"
@@ -297,7 +322,6 @@ config_menu() {
         "" \
         "VirusTotal : activer / désactiver  [$( [ "${ENABLE_VIRUSTOTAL:-no}" = "yes" ] && echo activé || echo désactivé )]" \
         "VirusTotal : définir la clé API   [$key_lbl]" \
-        "Verrouillage des preuves  [$( [ "${LOCK_EVIDENCE:-yes}" = "yes" ] && echo activé || echo désactivé )]" \
         "Destination de l'archive chiffrée  [${seal_dest_label:-à côté du dossier de preuve}]" \
         "Analyste [${ANALYST:-$(whoami)}]" \
         "Structure [${STRUCTURE_NAME:-non renseignée}]" \
@@ -353,20 +377,6 @@ config_menu() {
         continue_or_back "Définir la clé API VirusTotal"
         ;;
       3)
-        screen_clear
-        cur="${LOCK_EVIDENCE:-yes}"
-        if ask_yesno "Verrouiller les preuves en lecture seule ?" "$([ "$cur" = "yes" ] && echo y || echo n)"; then
-          LOCK_EVIDENCE="yes"
-          config_set_value "LOCK_EVIDENCE" "yes"
-          log_ok "Verrouillage des preuves activé."
-        else
-          LOCK_EVIDENCE="no"
-          config_set_value "LOCK_EVIDENCE" "no"
-          log_warn "Verrouillage des preuves désactivé."
-        fi
-        continue_or_back "Verrouillage des preuves"
-        ;;
-      4)
         screen_clear
         banner "Destination de l'archive chiffrée"
         log_info "Par défaut, l'archive chiffrée est écrite à côté du dossier de"
@@ -438,7 +448,7 @@ config_menu() {
         log_info "  Si la place manque au scellement, le mode flux sera utilisé."
         continue_or_back "Destination de l'archive chiffrée"
         ;;
-      5)
+      4)
         screen_clear
         new_analyst="$(ask_input "Nom de l'analyste :" "${ANALYST:-$(whoami)}")"
         if [ -n "$new_analyst" ]; then
@@ -450,7 +460,7 @@ config_menu() {
         fi
         continue_or_back "Définir l'analyste"
         ;;
-      6)
+      5)
         screen_clear
         new_struct="$(ask_input "Nom de la structure :" "${STRUCTURE_NAME:-}")"
         if [ -n "$new_struct" ]; then
@@ -519,16 +529,6 @@ iocs_menu() {
       *) log_ok "Retour au menu principal."; return 0 ;;
     esac
   done
-}
-
-choose_label() {  # $1..n : labels ; imprime l'index choisi (1-based)
-  local i label choice
-  choice="$(menu_select "Quel appareil analyser ?" "$@")"
-  for ((i=1;i<=$#;i++)); do
-    label="${!i}"
-    [ "$label" = "$choice" ] && { echo "$i"; return 0; }
-  done
-  echo 1
 }
 
 detect_ios() {
@@ -600,8 +600,13 @@ wait_for_device() {
     else
       read -r || return 1   # repli non-interactif
     fi
-    if [ "$plat" = "ios" ]; then detect_ios; else detect_android; fi
-    if [ "$plat" = "ios" ]; then [ "${#IOS_DEVICES[@]}" -ge 1 ] && found=1; else [ "${#ANDROID_SERIALS[@]}" -ge 1 ] && found=1; fi
+    if [ "$plat" = "ios" ]; then
+      detect_ios
+      [ "${#IOS_DEVICES[@]}" -ge 1 ] && found=1
+    else
+      detect_android
+      [ "${#ANDROID_SERIALS[@]}" -ge 1 ] && found=1
+    fi
     [ "$found" -eq 0 ] && log_warn "Toujours pas détecté — rebranchez / autorisez, puis Entrée."
   done
   return 0
@@ -630,20 +635,13 @@ hash_external() {  # hash d'une source externe SANS la modifier
 }
 
 run_mvt() {
-  local cmd=("$@")
-  local mlog rc
+  local cmd=("$@") mlog rc
   audit_log "CMD: ${cmd[*]}"
   log_info "Lancement : ${cmd[*]}"
   mlog="$(mktemp)"
-  if run_with_progress "Analyse MVT (${cmd[0]})…" "$mlog" "${cmd[@]}"; then
-    rc=0
-  else
-    rc=1
-  fi
-  if [ -s "$mlog" ]; then
-    printf '\n'
-    tail -n 6 "$mlog"
-  fi
+  run_with_progress "Analyse MVT (${cmd[0]})…" "$mlog" "${cmd[@]}"
+  rc=$?
+  [ -s "$mlog" ] && { printf '\n'; tail -n 6 "$mlog"; }
   rm -f "$mlog"
   return "$rc"
 }
@@ -691,23 +689,6 @@ case_rename_with_imei() {
   AUDIT_FILE="$case_dir/audit.log"
 }
 
-# Choix unique post-acquisition : préservation ou analyse MVT.
-# $1 = plateforme (iOS / Android). Met à jour FAST et _asi_label.
-post_acquisition_choice() {
-  local plat="$1" answer
-  local opts=("Préservation + orientation (défaut — aucune analyse)")
-  [ "$plat" = "iOS" ] && opts+=("Analyse rapide (MVT --fast)")
-  opts+=("Analyse complète (MVT, IoCs, tous modules)")
-
-  answer="$(menu_select "Que faire après l'acquisition $plat ?" "${opts[@]}")"
-  case "$answer" in
-    *Préservation*) FAST="preserve"; _asi_label="préservation + orientation (analyse non lancée)" ;;
-    *rapide*)       FAST="y";        _asi_label="rapide (--fast)" ;;
-    *complète*)     FAST="n";        _asi_label="complète (IoCs actifs)" ;;
-  esac
-  custody_log "Choix post-acquisition $plat : $_asi_label (loi Godfrain — analyse uniquement si éligible)."
-}
-
 # Acquisition iOS (idevicebackup2) : sélection du device, sauvegarde,
 # chiffrement, déchiffrement éventuel. Table 0 si refus/annulation.
 analyse_acquisition_ios() {
@@ -720,7 +701,8 @@ analyse_acquisition_ios() {
     IFS='|' read -r ud n mo v <<< "$line"
     local_labels+=("$n — $mo (iOS $v) — $ud")
   done
-  idx="$(choose_label "${local_labels[@]}")"
+  idx="$(menu_select_idx "Quel appareil analyser ?" "${local_labels[@]}")"
+  [[ "$idx" =~ ^[0-9]+$ ]] || idx=1
   IFS='|' read -r IOS_UDID IOS_NAME IOS_MODEL IOS_VER <<< "${IOS_DEVICES[$((idx-1))]}"
   log_info "Appareil sélectionné : $IOS_NAME ($IOS_MODEL), iOS $IOS_VER"
   custody_log "Appareil sélectionné : $IOS_NAME ($IOS_MODEL) iOS $IOS_VER — UDID $IOS_UDID"
@@ -837,7 +819,8 @@ analyse_acquisition_android() {
     IFS='|' read -r s d m v <<< "$line"
     local_labels+=("$d $m — $v — $s")
   done
-  idx="$(choose_label "${local_labels[@]}")"
+  idx="$(menu_select_idx "Quel appareil analyser ?" "${local_labels[@]}")"
+  [[ "$idx" =~ ^[0-9]+$ ]] || idx=1
   ANDROID_SERIAL="${ANDROID_SERIALS[$((idx-1))]}"
   IFS='|' read -r ANDROID_SERIAL ANDROID_MAKER ANDROID_MODEL ANDROID_REL <<< "${ANDROID_DEVICES[$((idx-1))]}"
   log_info "Appareil sélectionné : $ANDROID_MAKER $ANDROID_MODEL, $ANDROID_REL — serial $ANDROID_SERIAL"
@@ -939,7 +922,7 @@ analyse_build_mvt() {
       ab)        mvt_cmd=(mvt-android check-backup) ;;
       *)         mvt_cmd=(mvt-android check-androidqf) ;;
     esac
-    if [ "$FAST" != "preserve" ] && [ "${mvt_cmd[0]}" = "mvt-android" ] \
+    if [ "${mvt_cmd[0]}" = "mvt-android" ] \
        && [ "$ANALYSIS_TYPE" = "androidqf" ] \
        && [ "${ENABLE_VIRUSTOTAL:-no}" = "yes" ] && [ -n "${MVT_VT_API_KEY:-}" ]; then
       # Choix interactif à chaque analyse : une vérification VirusTotal est longue.
@@ -952,24 +935,16 @@ analyse_build_mvt() {
       fi
     fi
   fi
-  # --fast n'est supporté que par mvt-ios check-backup/check-fs ;
-  # mvt-android (check-androidqf/check-backup) et check-sysdiagnose le refusent.
-  [ "$FAST" = "y" ] && [ "$platform" = "iOS" ] && [ "$ANALYSIS_TYPE" != "sysdiagnose" ] && mvt_cmd+=(--fast)
   mvt_cmd+=(--output "$results")
   mvt_cmd+=("$ANALYSIS_INPUT")
 }
 
 analyse_run_mvt() {
-  if [ "$FAST" = "preserve" ]; then
-    custody_log "$platform — préservation : analyse NON lancée (préservation avant remédiation ; aucune remédiation à ce stade)."
-    orientation_accompagnement "$platform" 2>/dev/null || true
+  if run_mvt "${mvt_cmd[@]}"; then
+    custody_log "Analyse MVT exécutée : ${mvt_cmd[*]}"
   else
-    if run_mvt "${mvt_cmd[@]}"; then
-      custody_log "Analyse MVT exécutée : ${mvt_cmd[*]}"
-    else
-      custody_log "INCIDENT : analyse MVT en échec (${mvt_cmd[*]})"
-      log_err "Analyse MVT en échec (voir erreurs ci-dessus)."
-    fi
+    custody_log "INCIDENT : analyse MVT en échec (${mvt_cmd[*]})"
+    log_err "Analyse MVT en échec (voir erreurs ci-dessus)."
   fi
 }
 
@@ -1113,8 +1088,8 @@ EOF
     analyse_existing "$platform"
   fi
 
-  # --- Choix unique post-acquisition (préservation ou analyse MVT) ---
-  post_acquisition_choice "$platform"
+  # --- Analyse complète systématique (IoCs actifs, tous modules) ---
+  custody_log "Analyse complète $platform (IoCs actifs, loi Godfrain — analyse uniquement si éligible)."
 
   analyse_build_mvt
   analyse_run_mvt
@@ -1127,11 +1102,14 @@ EOF
 # ============================================================
 main_menu() {
   local opt
+  MENU_MODE=1
+  offer_clean_open_temps
   while :; do
     screen_clear
     ascii_banner "MVT Analyse" "=== MENU PRINCIPAL ==="
     opt="$(menu_select "Que souhaitez-vous faire ?" \
         "Lancer une analyse" \
+        "Consulter une archive chiffrée" \
         "Gérer les IoCs" \
         "Configuration" \
         "Vérifier les dépendances" \
@@ -1142,6 +1120,7 @@ main_menu() {
       *analyse*) screen_clear; cmd_analyse;       continue_or_back "Lancer une analyse" ;;
       *iocs*)    screen_clear; iocs_menu;         continue_or_back "Gérer les IoCs" ;;
       *config*)  screen_clear; config_menu;       continue_or_back "Configuration" ;;
+      *consulter*|*chiffrée*) screen_clear; cmd_open; continue_or_back "Consulter une archive chiffrée" ;;
       *dépend*)  screen_clear; install_shortcut;  continue_or_back "Vérifier les dépendances" ;;
       *purg*)    screen_clear; cmd_purge;         continue_or_back "Purger les preuves" ;;
       *) echo ""; log_ok "Au revoir."; return 0 ;;
@@ -1181,6 +1160,160 @@ dedicated_terminal() {
   esac
 }
 
+# Consultation d'une affaire scellée : déchiffre l'affaire COMPLÈTE vers un
+# dossier temporaire en lecture seule, puis l'ouvre dans le gestionnaire de
+# fichiers. L'utilisateur décide ensuite quoi en faire (rien n'est supprimé).
+# Un dossier clair (SEAL_METHOD lock/no) est simplement ouvert sur place.
+#   ./start.sh open            -> menu de sélection des affaires
+#   ./start.sh open 20261012   -> ouvre l'affaire CASE-2026... correspondante
+cmd_open() {
+  local target="${1:-}" base="" state="" idx
+  local -a bases=() states=() labels=()
+  local b st
+
+  while IFS=$'\t' read -r b st; do
+    [ -n "$b" ] || continue
+    bases+=("$b"); states+=("$st")
+    labels+=("$(basename "$b")  [${st}]")
+  done < <(sealed_cases)
+
+  if [ "${#bases[@]}" -eq 0 ]; then
+    log_warn "Aucune affaire trouvée dans $EVIDENCE_DIR."
+    return 0
+  fi
+
+  if [ -n "$target" ]; then
+    for idx in "${!bases[@]}"; do
+      case "$(basename "${bases[$idx]}")" in
+        "$target"|*"$target"*) base="${bases[$idx]}"; state="${states[$idx]}"; break ;;
+      esac
+    done
+    [ -n "$base" ] || { log_err "Aucune affaire ne correspond à '$target'."; return 1; }
+  else
+    labels+=("Retour")
+    idx="$(menu_select_idx "Quelle affaire ouvrir ?" "${labels[@]}")"
+    [[ "$idx" =~ ^[0-9]+$ ]] || { log_info "Consultation annulée."; return 0; }
+    [ "$idx" -eq "${#labels[@]}" ] && { log_ok "Retour."; return 0; }
+    [ "$idx" -ge 1 ] && [ "$idx" -le "${#bases[@]}" ] || { log_err "Choix invalide."; return 1; }
+    base="${bases[$((idx-1))]}"; state="${states[$((idx-1))]}"
+  fi
+
+  screen_clear
+  banner "CONSULTATION : $(basename "$base")  [$state]"
+  echo ""
+
+  # Affaire en clair (ou verrouillée +i) : ouvert directement, sans copie.
+  if [ "$state" != "archive" ] && [ "$state" != "flux" ]; then
+    if open_in_file_manager "$base"; then
+      log_ok "Dossier ouvert : $base"
+    else
+      log_warn "Aucun gestionnaire de fichiers trouvé. Dossier : $base"
+    fi
+    return 0
+  fi
+
+  # Archive chiffrée : déchiffrement dans un dossier temporaire.
+  local tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/mvt-open.XXXXXX")" \
+    || { log_err "Impossible de créer un dossier temporaire."; return 1; }
+
+  local sz avail
+  sz="$(du -sb "$base.aes256.tar.gz" 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
+  avail="$(seal_avail_bytes "$tmp")"
+  [ "$avail" -gt "$sz" ] || log_warn "Espace libre limité ($(seal_human_bytes "$avail")) : l'extraction peut échouer."
+
+  local pw ok=0 attempt=1
+  while [ "$attempt" -le 3 ]; do
+    pw="$(read_secret_prompt "Mot de passe (tentative $attempt/3) : ")" \
+      || { rm -rf "$tmp"; log_err "Saisie interrompue - consultation annulée."; return 1; }
+    if unseal_extract "$base" "$tmp" all "$pw"; then ok=1; break; fi
+    log_err "Déchiffrement impossible (mot de passe incorrect ou archive illisible)."
+    find "$tmp" -mindepth 1 -delete 2>/dev/null
+    attempt=$((attempt + 1))
+  done
+  if [ "$ok" -ne 1 ]; then
+    rm -rf "$tmp"
+    log_err "Échec après 3 tentatives - consultation annulée."
+    return 1
+  fi
+
+  # Le wrapper tourne en root : un dossier root en 0700 serait illisible par
+  # le gestionnaire de fichiers de l'utilisateur réel. On le lui attribue.
+  local ru; ru="$(real_user)"
+  if [ "$(id -u)" = "0" ] && [ "$ru" != "root" ]; then
+    chown -R "$ru" "$tmp" 2>/dev/null || true
+  fi
+
+  # Lecture seule : le contenu reste consultable mais non modifiable.
+  find "$tmp" -type f -exec chmod a-w {} + 2>/dev/null || true
+
+  register_open_tmp "$tmp"
+
+  if open_in_file_manager "$tmp"; then
+    log_ok "Dossier déchiffré ouvert (lecture seule) : $tmp"
+  else
+    log_warn "Aucun gestionnaire de fichiers trouvé. Dossier déchiffré : $tmp"
+  fi
+
+  if [ "${MENU_MODE:-0}" = "1" ]; then
+    echo ""
+    log_info "Dossier temporaire (lecture seule). Il sera supprimé automatiquement à la fermeture du wrapper."
+  else
+    echo ""
+    log_info "Dossier temporaire (lecture seule) : $tmp"
+    printf 'Appuyez sur Entrée pour supprimer les fichiers temporaires et quitter...' >&2
+    read -r _ || true
+  fi
+  return 0
+}
+
+# Ouvre un dossier dans le gestionnaire de fichiers de l'utilisateur réel.
+# Le wrapper tourne souvent en root (sudo) : un gestionnaire lancé en root
+# n'a ni la session graphique ni les bons droits. On redescend donc vers
+# l'utilisateur réel (setpriv) en lui repassant l'environnement de session.
+open_in_file_manager() {
+  local dir="$1" fm abspath u g line
+  [ -d "$dir" ] || return 1
+  for fm in dolphin nautilus nemo caja thunar pcmanfm xdg-open; do
+    abspath="$(command -v "$fm" 2>/dev/null)" || continue
+    [ -n "$abspath" ] || continue
+    if [ "$(id -u)" = "0" ] && [ "$(real_user)" != "root" ] && command -v setpriv >/dev/null 2>&1; then
+      u="$(real_user)"; g="$(id -gn "$u" 2>/dev/null || echo "$u")"
+      local -a genv=()
+      while IFS= read -r line; do [ -n "$line" ] && genv+=("$line"); done < <(harvest_gui_env "$u")
+      genv+=("HOME=$(getent passwd "$u" | cut -d: -f6)" "USER=$u" "LOGNAME=$u" \
+             "PATH=/usr/local/bin:/usr/bin:/bin")
+      setsid -f setpriv --reuid "$u" --regid "$g" --init-groups \
+        env "${genv[@]}" "$abspath" "$dir" >/dev/null 2>&1 &
+    else
+      if command -v setsid >/dev/null 2>&1; then
+        setsid -f "$abspath" "$dir" >/dev/null 2>&1 &
+      else
+        nohup "$abspath" "$dir" >/dev/null 2>&1 &
+      fi
+    fi
+    return 0
+  done
+  return 1
+}
+
+# Propose de nettoyer les dossiers temporaires restants d'anciennes sessions.
+offer_clean_open_temps() {
+  local base="${TMPDIR:-/tmp}" d
+  local -a dirs=()
+  while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done \
+    < <(find "$base" -maxdepth 1 -type d -name 'mvt-open.*' 2>/dev/null | sort)
+  [ "${#dirs[@]}" -eq 0 ] && return 0
+  if ask_yesno "Nettoyer ${#dirs[@]} dossier(s) temporaire(s) d'anciennes consultations ?" "y"; then
+    for d in "${dirs[@]}"; do
+      chmod -R u+w "$d" 2>/dev/null || true
+      rm -rf "$d"
+    done
+    log_ok "Temporaires nettoyés (${#dirs[@]})."
+  fi
+  return 0
+}
+
 # Purge des preuves : retire le scellement (chattr -i / déchiffre AES) puis supprime.
 # Avec argument : son regex CASE-XXX ; sinon : menu de sélection.
 #   ./start.sh purge            -> menu de sélection des affaires
@@ -1198,14 +1331,8 @@ cmd_purge() {
     esac
   done
 
-  # Digère une affaire : unseal_and_delete déverrouille (chattr -i / chmod),
-  # teste le mot de passe si scellée, puis supprime le dossier clair.
-  # Pas de rm -rf supplémentaire ici : cela masquait un échec réel de
-  # unseal_and_delete (qui renvoyait 0 sans rien supprimer).
-  purge_case() {
-    unseal_and_delete "$1"
-  }
-
+  # unseal_and_delete déverrouille (chattr -i / chmod) puis supprime les
+  # preuves (dossier clair, dossier chiffré en flux et/ou archive).
   if [ -n "$target" ]; then
     local found=""
     for d in "${cases[@]:-}"; do
@@ -1214,7 +1341,7 @@ cmd_purge() {
       esac
     done
     [ -z "$found" ] && { log_err "Aucune affaire ne correspond à '$target'."; return 1; }
-    purge_case "$found" || return 1
+    unseal_and_delete "$found" || return 1
     return 0
   fi
 
@@ -1268,7 +1395,7 @@ cmd_purge() {
     return 1
   fi
 
-  if purge_case "$d"; then
+  if unseal_and_delete "$d"; then
     log_ok "Preuves purgées : $d"
     custody_log "Purge effectuée (confirmation explicite par l'analyste) : $name"
   else
@@ -1282,23 +1409,28 @@ cmd_purge() {
 # ============================================================
 #  LANCEMENT
 # ============================================================
-SUB="${1:-}"
-[ $# -gt 0 ] && shift
-rc=0
-case "$SUB" in
-  ""|menu)            main_menu ;;
-  analyse|analyze)    cmd_analyse "$@" || rc=1 ;;
-  iocs)               iocs_menu ;;
-  update-iocs|update) cmd_update ;;
-  add)                cmd_add "${1:-}" || rc=1 ;;
-  add-repo)           cmd_add_repo "${1:-}" || rc=1 ;;
-  list-iocs|list)     cmd_list ;;
-  env-iocs|env)       cmd_env ;;
-  config)             config_menu ;;
-  install)            install_shortcut ;;
-  terminal|--dedicated) dedicated_terminal "${1:-analyse}" ;;
-  purge)                cmd_purge "$@" || rc=1 ;;
-  -h|--help|help)     usage ;;
-  *) log_err "Sous-commande inconnue : $SUB" ; usage ; exit 1 ;;
-esac
-exit $rc
+# Exécuté uniquement si le script est lancé directement ; permet de le
+# sourcer (tests) sans déclencher la sous-commande ni le `exit` final.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  SUB="${1:-}"
+  [ $# -gt 0 ] && shift
+  rc=0
+  case "$SUB" in
+    ""|menu)            main_menu ;;
+    analyse|analyze)    cmd_analyse "$@" || rc=1 ;;
+    iocs)               iocs_menu ;;
+    update-iocs|update) cmd_update ;;
+    add)                cmd_add "${1:-}" || rc=1 ;;
+    add-repo)           cmd_add_repo "${1:-}" || rc=1 ;;
+    list-iocs|list)     cmd_list ;;
+    env-iocs|env)       cmd_env ;;
+    config)             config_menu ;;
+    install)            install_shortcut ;;
+    terminal|--dedicated) dedicated_terminal "${1:-analyse}" ;;
+    open|show|consulter|ouvrir) cmd_open "$@" || rc=1 ;;
+    purge)                cmd_purge "$@" || rc=1 ;;
+    -h|--help|help)     usage ;;
+    *) log_err "Sous-commande inconnue : $SUB" ; usage ; exit 1 ;;
+  esac
+  exit $rc
+fi

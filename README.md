@@ -50,17 +50,36 @@ La sélection des options se fait **avec les flèches du clavier** :
 ./start.sh add-repo https://github.com/user/mes-iocs.git    # ajoute un dépôt
 ./start.sh list-iocs                                        # liste les IoCs chargés
 ./start.sh env-iocs                                         # affiche l'export MVT_STIX2 à copier
+./start.sh open                                             # consulte une affaire scellée (déchiffre dans un dossier temporaire)
+./start.sh open 20261012                                    # ouvre l'affaire dont le nom contient « 20261012 »
 ./start.sh purge                                            # supprime définitivement une affaire (dossier de preuves)
 ./start.sh purge 20260928                                   # purge l'affaire dont le nom contient « 20260928 »
 ./start.sh install                                          # lance install.sh
 ./start.sh help                                             # aide
 ```
 
+`open` est aussi accessible depuis le menu principal (« Consulter une archive
+chiffrée », juste après « Lancer une analyse »). Sur une affaire **chiffrée**,
+le wrapper demande le mot de passe (3 tentatives), déchiffre **l'affaire
+complète** dans un dossier temporaire (`mktemp -d`) passé en **lecture seule**,
+puis l'ouvre dans le **gestionnaire de fichiers** de l'utilisateur (nouvel
+onglet/fenêtre). L'utilisateur consulte alors ce qu'il souhaite. Le dossier
+temporaire est **supprimé automatiquement à la fermeture du wrapper** (Quitter,
+Ctrl-C, fermeture du terminal) ; en ligne de commande (`./start.sh open …`), le
+wrapper attend que vous appuyiez sur **Entrée** avant de le supprimer et de
+quitter. Au démarrage du menu, il vous est proposé de nettoyer d'éventuels
+dossiers `mvt-open.*` restants d'anciennes sessions. Une affaire en clair (ou
+verrouillée `+i`) est simplement ouverte sur place.
+
+Le wrapper s'exécutant souvent via `sudo`, le gestionnaire de fichiers est
+relancé en tant qu'**utilisateur réel** (`$SUDO_USER`, via `setpriv`) avec
+l'environnement de session (`DISPLAY`, `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`,
+`XDG_RUNTIME_DIR`) : sans cela, un gestionnaire lancé en root ne s'affiche pas.
+
 `purge` est aussi accessible depuis le menu principal (« Purger les preuves
 (destructif) », avant « Quitter »). Comme il supprime définitivement des
 preuves, il demande **deux confirmations** : un oui/non, puis la saisie du
-nom exact de l'affaire. Le mot de passe de scellement est exigé si les preuves
-sont chiffrées.
+nom exact de l'affaire. Aucun mot de passe n'est demandé.
 
 ## Gérer les IoCs (menu « Gérer les IoCs »)
 
@@ -90,6 +109,9 @@ L'assistant vous guide :
 5. Pour une acquisition : le wrapper **attend l'appareil** 
 6. Acquisition / analyse, puis **rapport** des menaces détectées.
 
+L'analyse MVT est **toujours complète** (IoCs actifs, tous modules) : aucune
+question post-acquisition, aucun mode préservation/rapide à choisir.
+
 ---
 
 ## Ce que le wrapper fait pour vous
@@ -97,7 +119,7 @@ L'assistant vous guide :
 ### Acquisition
 - **iOS** : sauvegarde iTunes (`idevicebackup2`), recommande le backup **chiffré** (sinon des données clés manquent : appels, historique Safari…), **détecte le chiffrement réel de la backup créée** via `Manifest.plist` (`IsEncrypted`) — ni le statut device, ni une réponse utilisateur — puis demande le mot de passe **après** la sauvegarde et déchiffre automatiquement. Un backup non chiffré n'engendre plus de tentative de déchiffrement inutile.
 - **Android** : acquisition avec l'outil **AndroidQF**.
-- **Identification du terminal** : nom, modèle, iOS, build, série, IMEI… lus des **plists** de la backup (`Info.plist`, `Manifest.plist`) — renseignée même sans analyse MVT (mode préservation) et reprise dans le registre et le rapport.
+- **Identification du terminal** : nom, modèle, iOS, build, série, IMEI… lus des **plists** de la backup (`Info.plist`, `Manifest.plist`) — renseignée dès l'acquisition et reprise dans le registre et le rapport.
 
 ### Préservation des preuves
 Chaque analyse est rangée dans `evidence/CASE-AAAA-MMJJ-HHMMSS/` :
@@ -106,7 +128,10 @@ Chaque analyse est rangée dans `evidence/CASE-AAAA-MMJJ-HHMMSS/` :
 - un manifeste de l'acquisition brute (`SHA256SUMS-acquisition.txt`) avant toute transformation,
 - un **journal de traçabilité** (`chain_of_custody.txt`) qui couvre les 11 champs du registre : référence d'affaire, opérateur **+ structure**, **terminal identifié**, versions outils/composants, **version/date de la base d'IoCs**, opérations horodatées, empreintes SHA-256 **horodatées**, lieu/conservation (**hôte** + **modalité de scellement**), **référence du consentement écrit**, anomalies/incidents (échec MVT, quarantaines…),
 - un journal des commandes exécutées (`audit.log`),
-- le dossier passe en **lecture seule** à la fin (et immuable si lancé en `root`).
+- le dossier est ensuite **scellé par chiffrement AES-256** (`SEAL_METHOD="encrypt"`,
+  défaut) : la version claire est supprimée, seul le chiffré subsiste. Le mode
+  `SEAL_METHOD="lock"` conserve l'ancien comportement (lecture seule `a-w`, et
+  immuable `chattr +i` si lancé en `root`).
 
 L'acquisition brute est préservée telle quelle.
 
@@ -115,7 +140,7 @@ Dans `evidence/CASE-.../results/` :
 
 - `rapport.txt` : **mentions obligatoires** (identité et **structure** d'accueil de l'analyste, date/heure/terminal, **référence du consentement écrit** recueilli avant analyse, versions wrapper/MVT **et de chaque composant**, **machine d'analyse**, **base d'IoCs avec version/date**, **méthode + limites**, **niveau de confiance avec distinction spyware avéré / usage double légitime**), **identification du dispositif** (nom, marque, modèle, OS, build, IMEI, n° de série, numéro), **synthèse des menaces par niveau de gravité**, explication simple de chaque module, **état d'intégrité des preuves avec empreintes** — le tout horodaté et **scellé SHA256**,
 - les fichiers JSON bruts de MVT (dont `*_detected.json`),
-- `rapport.pdf` : version **imprimable** du rapport, générée par le wrapper en **pur Python (bibliothèque standard, aucune dépendance externe)** ; produite après le scellement et donc **hors manifeste**, à l'identique de `rapport.txt` (les encadrés y sont rendus en ASCII : `═`→`=`, `↑`→`^`…).
+- `rapport.pdf` : version **structurée et imprimable** du rapport (titres colorés, tableau d'identification, pastilles de sévérité, encadré de verdict, pagination), générée par le wrapper en **pur Python (bibliothèque standard, aucune dépendance externe — moteur `lib/report_pdf.py`)** ; produite après le scellement et donc **hors manifeste**. Le contenu reste celui de `rapport.txt` (les séparateurs `═`/`─` y sont interprétés comme structuration, plus rendus tels quels).
 
 ### Scellement des preuves (chiffrement AES-256)
 
@@ -193,7 +218,11 @@ mvt-wrapper/
 ├── .env                  # secrets : clé VirusTotal (généré par install.sh, gitignoré)
 ├── lib/
 │   ├── common.sh         # fonctions partagées
+│   ├── deviceinfo.py     # parseur d'appareil unifié (Android/iOS)
+│   ├── report_pdf.py     # moteur PDF du rapport (stdlib seule)
 │   └── jsonutils.py      # helper JSON partagé (recherche récursive de clé)
+├── tests/
+│   └── smoke.sh          # vérifications rapides (syntaxe, shellcheck, PDF)
 ├── iocs/
 │   ├── custom/           # IoCs ajouté à la main
 │   └── managed/          # dépôts IoCs synchronisés automatiquement
@@ -208,7 +237,6 @@ mvt-wrapper/
 | `DOWNLOAD_OFFICIAL_IOCS` | télécharger les IoCs officiels de MVT |
 | `IOC_REPOS` | liste des dépôts git d'IoCs synchronisés (ajout via le menu) |
 | `ENABLE_VIRUSTOTAL` | vérification des APK Android sur VirusTotal — la clé se renseigne dans `.env`, jamais dans `config.sh` (voir ci-dessous) |
-| `LOCK_EVIDENCE` | verrouillage des preuves en lecture seule |
 | `ANALYST` | nom affiché dans les rapports |
 
 ### Clé VirusTotal (`MVT_VT_API_KEY`)
@@ -223,6 +251,7 @@ Vous pouvez aussi éditer `.env` à la main (`MVT_VT_API_KEY="votre-cle"`) puis 
 ## Vérifier le code
 
 ```bash
+bash tests/smoke.sh                                    # syntaxe + shellcheck + Python + PDF
 bash -n start.sh lib/common.sh install.sh config.sh   # vérification syntaxe bash
 shellcheck -x start.sh lib/common.sh install.sh       # analyse statique (warnings/erreurs)
 ```

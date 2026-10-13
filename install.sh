@@ -38,9 +38,8 @@ IOC_REPOS=(
 UPDATE_IOCS_BEFORE_ANALYSIS="yes"
 DOWNLOAD_OFFICIAL_IOCS="yes"
 
-# Scellement des preuves ("encrypt" | "lock" | "no") et verrouillage
+# Scellement des preuves ("encrypt" | "lock" | "no")
 SEAL_METHOD="encrypt"
-LOCK_EVIDENCE="no"
 
 # Destination de l'archive chiffrée : vide = à côté du dossier de preuve.
 # Renseignez un autre volume si le dossier est trop volumineux pour être
@@ -160,7 +159,10 @@ python3 -c 'import sys; assert sys.version_info >= (3, 6)' 2>/dev/null || die "P
 # 1. Paquets système
 # ------------------------------------------------------------------
 log_info "Installation des paquets système utilisés pour la compilation et les IoCs..."
-$SUDO apt-get update -qq || true
+apt_log="$($SUDO apt-get update -qq 2>&1 || true)"
+if printf '%s' "$apt_log" | grep -qiE 'not signed|pas signé|non signé|NO_PUBKEY|Missing key|OpenPGP'; then
+  log_warn "apt-get update : dépôt(s) tiers non signé(s). Aucun impact sur l'outil."
+fi
 
 APKS=(
   python3 python3-venv python3-pip sqlite3
@@ -168,11 +170,15 @@ APKS=(
   pipx git curl wget unzip
 )
 for p in "${APKS[@]}"; do
-  if dpkg -s "$p" >/dev/null 2>&1; then
+  if dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -q 'install ok installed'; then
     log_ok "  $p déjà installé."
   else
     log_info "  Installation de $p ..."
-    $SUDO apt-get install -y "$p" >/dev/null || log_warn "   Échec de l'installation de $p"
+    if $SUDO apt-get install -y "$p" >/dev/null 2>&1; then
+      log_ok "  $p installé."
+    else
+      log_warn "   Échec de l'installation de $p"
+    fi
   fi
 done
 

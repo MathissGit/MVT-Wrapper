@@ -168,21 +168,59 @@ ask_input() {
 }
 
 # ------------------------------------------------------------------
-# Fenêtre de sélection de DOSSIER (zenity / kdialog), avec repli en
-# saisie manuelle. Même approche que pick_acquisition_path, mais
-# --directory : on ne peut choisir qu'un dossier, pas un fichier.
-# Le dossier de départ est proposé ; rien n'est créé ni modifié ici.
-# ------------------------------------------------------------------
-pick_directory_gui() {
-  local title="$1" start="${2:-$PWD}" got=""
+# Fenêtre de sélection native (zenity/kdialog). $3 = dir (défaut) | file.
+# Renvoie le chemin choisi, vide si annulé ou sans GUI. Ne crée rien.
+pick_gui_path() {
+  local title="$1" start="${2:-$PWD}" mode="${3:-dir}" got=""
   [ -d "$start" ] || start="$PWD"
   if command -v zenity >/dev/null 2>&1; then
-    got="$(zenity --file-selection --directory --confirm-overwrite \
-            --title="$title" --filename="$start/" 2>/dev/null || true)"
+    local args=(--file-selection --title="$title")
+    [ "$mode" = "dir" ] && args+=(--directory)
+    got="$(zenity "${args[@]}" --filename="$start/" 2>/dev/null || true)"
   elif command -v kdialog >/dev/null 2>&1; then
-    got="$(kdialog --getexistingdirectory "$start" 2>/dev/null || true)"
+    if [ "$mode" = "dir" ]; then
+      got="$(kdialog --getexistingdirectory "$start" 2>/dev/null || true)"
+    else
+      got="$(kdialog --getopenfilename "$start" 2>/dev/null || true)"
+    fi
   fi
   printf '%s' "$got"
+}
+
+# Fenêtre de sélection de DOSSIER (raccourci de pick_gui_path).
+pick_directory_gui() {
+  pick_gui_path "$1" "${2:-$PWD}" dir
+}
+
+# Utilisateur réel derrière sudo (le wrapper tourne souvent en root).
+real_user() { printf '%s' "${SUDO_USER:-$USER}"; }
+
+# Environnement graphique de l'utilisateur réel. Le wrapper tourne en root
+# (sudo) et n'hérite donc pas de XAUTHORITY/DBUS/XDG_RUNTIME_DIR propres à la
+# session : un gestionnaire lancé en root ne s'affiche pas. On relit ces
+# variables depuis /proc/<pid>/environ d'un process de cet utilisateur (root
+# peut le lire), avec repli sur des valeurs usuelles d'une session unique.
+# Imprime des lignes KEY=VALUE destinées à `env`.
+harvest_gui_env() {
+  local u="${1:-$(real_user)}" pid home uid env
+  home="$(getent passwd "$u" 2>/dev/null | cut -d: -f6)"
+  uid="$(id -u "$u" 2>/dev/null)"
+  for pid in $(pgrep -u "$u" 2>/dev/null); do
+    [ -r "/proc/$pid/environ" ] || continue
+    env="$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n')"
+    case "$env" in
+      DISPLAY=*|*$'\n'DISPLAY=*) ;;
+      *) continue ;;
+    esac
+    printf '%s\n' "$env" \
+      | grep -aE '^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|XDG_SESSION_TYPE|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|KDE_FULL_SESSION|QT_QPA_PLATFORM)='
+    return 0
+  done
+  printf 'DISPLAY=%s\n' "${DISPLAY:-:0}"
+  [ -n "$uid" ] && printf 'XDG_RUNTIME_DIR=/run/user/%s\n' "$uid"
+  [ -n "$uid" ] && [ -S "/run/user/$uid/bus" ] && printf 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%s/bus\n' "$uid"
+  [ -n "$home" ] && [ -f "$home/.Xauthority" ] && printf 'XAUTHORITY=%s\n' "$home/.Xauthority"
+  return 0
 }
 
 # Un chemin donné peut-il être un volume "amovible" (/media, /run/media,
@@ -308,46 +346,32 @@ pick_directory() {
 }
 
 # ------------------------------------------------------------------
-# Choix du chemin d'acquisition / backup : flèches (candidats auto
-# détectés) PUIS gestionnaire de fichiers (zenity/kdialog si présent)
-# PUIS saisie (repli). Ne modifie jamais le terminal ; retourne un
-# chemin canonique existant.
-# ------------------------------------------------------------------
+# Choix du chemin d'acquisition / backup : candidats auto-détectés PUIS
+# fenêtre native PUIS saisie manuelle. Retourne un chemin existant.
 pick_acquisition_path() {
   local candidates=() c pf default_dir
+  local title="Chemin de l'acquisition / backup"
   default_dir="${CASE_DIR:-$PWD}"
-  # 1. Candidats auto-détectés dans le périmètre courant (lecture seule)
   if [ -n "$default_dir" ] && [ -d "$default_dir" ]; then
     while IFS= read -r c; do
       [ -n "$c" ] && candidates+=("$c")
     done < <(find "$default_dir" -maxdepth 2 \( -name '*.ab' -o -name '*.zip' -o -name 'Manifest.db' \) 2>/dev/null)
   fi
-  # 2. Gestionnaire de fichiers si dispo : résultat placé en tête de liste
-  pf=""
-  if command -v zenity >/dev/null 2>&1; then
-    pf="$(zenity --file-selection --title="Choisir l'acquisition / backup" --filename="${default_dir}/" 2>/dev/null || true)"
-  elif command -v kdialog >/dev/null 2>&1; then
-    pf="$(kdialog --getexistingdirectory "$default_dir" 2>/dev/null || true)"
-  fi
+  pf="$(pick_gui_path "$title" "$default_dir" file)"
   [ -n "$pf" ] && candidates=( "$pf" "${candidates[@]}" )
-  # 3. Menu fléché si candidats, sinon saisie directe (repli)
   if [ "${#candidates[@]}" -gt 0 ]; then
     local chosen
-    chosen="$(menu_select "Chemin de l'acquisition / backup :" "${candidates[@]}" "Saisie manuelle" "Ouvrir le gestionnaire de fichiers")"
+    chosen="$(menu_select "$title :" "${candidates[@]}" "Saisie manuelle" "Ouvrir le gestionnaire de fichiers")"
     case "$chosen" in
       "Saisie manuelle")
-        chosen="$(ask_input "Chemin de l'acquisition / backup (dossier, .ab, .zip) :" "")" ;;
+        chosen="$(ask_input "$title (dossier, .ab, .zip) :" "")" ;;
       "Ouvrir le gestionnaire de fichiers")
-        if command -v zenity >/dev/null 2>&1; then
-          chosen="$(zenity --file-selection --title="Choisir l'acquisition / backup" --filename="${default_dir}/" 2>/dev/null || true)"
-        elif command -v kdialog >/dev/null 2>&1; then
-          chosen="$(kdialog --getexistingdirectory "$default_dir" 2>/dev/null || true)"
-        fi
-        [ -z "$chosen" ] && chosen="$(ask_input "Chemin de l'acquisition / backup (dossier, .ab, .zip) :" "")" ;;
+        chosen="$(pick_gui_path "$title" "$default_dir" file)"
+        [ -z "$chosen" ] && chosen="$(ask_input "$title (dossier, .ab, .zip) :" "")" ;;
     esac
     printf '%s' "$chosen"
   else
-    ask_input "Chemin de l'acquisition / backup (dossier, .ab, .zip) :" ""
+    ask_input "$title (dossier, .ab, .zip) :" ""
   fi
 }
 
@@ -615,8 +639,8 @@ verify_manifest() {
 }
 
 # Passage en lecture seule (chmod a-w, et chattr +i si root) -- ancienne méthode.
-# Depuis 1.4 : SEAL_METHOD pilote le scellement ; "encrypt" (défaut) ne verrouille
-# plus rien (dossier supprimable). "lock" conserve l'ancien comportement.
+# SEAL_METHOD pilote le scellement : "encrypt" (défaut) chiffre puis supprime le
+# clair (dossier restant supprimable) ; "lock" conserve le verrouillage a-w/+i.
 lock_dir() {
   local dir="$1"
   case "${SEAL_METHOD:-encrypt}" in
@@ -624,10 +648,6 @@ lock_dir() {
       seal_encrypted "$dir"
       ;;
     lock)
-      if [ "${LOCK_EVIDENCE:-yes}" = "no" ]; then
-        log_warn "Verrouillage des preuves désactivé - dossier modifiable."
-        return 0
-      fi
       chmod -R a-w "$dir" 2>/dev/null
       if [ "$(id -u)" = 0 ]; then
         chattr -R +i "$dir" 2>/dev/null
@@ -815,6 +835,21 @@ seal_incident() {
   audit_log "SCELLEMENT : $*"
 }
 
+# Saisie d'un secret sans écho : invite sur stderr, valeur sur stdout.
+# Refuse explicitement un stdin non interactif (sinon read renvoie EOF en
+# silence et le mot de passe serait vide).
+read_secret_prompt() {
+  local prompt="$1" val
+  if [ ! -t 0 ]; then
+    log_err "Aucun terminal (stdin non interactif) pour saisir le mot de passe."
+    return 1
+  fi
+  printf '%s' "$prompt" >&2
+  IFS= read -r -s val || { echo >&2; return 1; }
+  echo >&2
+  printf '%s' "$val"
+}
+
 # Saisie du mot de passe (2 fois). Refuse le non-TTY explicitement au lieu de
 # d'échouer en silence sur un read qui renvoie EOF.
 seal_read_password() {
@@ -823,12 +858,10 @@ seal_read_password() {
     log_err "Scellement impossible : aucun terminal (stdin non interactif) pour saisir le mot de passe."
     return 1
   fi
-  printf 'Mot de passe de scellement AES-256 (≥ 8 caractères) : ' >&2
-  IFS= read -r -s pw1 || { echo >&2; log_err "Saisie du mot de passe interrompue - scellement annulé."; return 1; }
-  echo >&2
-  printf 'Confirmez le mot de passe : ' >&2
-  IFS= read -r -s pw2 || { echo >&2; log_err "Saisie de la confirmation interrompue - scellement annulé."; return 1; }
-  echo >&2
+  pw1="$(read_secret_prompt 'Mot de passe de scellement AES-256 (≥ 8 caractères) : ')" \
+    || { log_err "Saisie du mot de passe interrompue - scellement annulé."; return 1; }
+  pw2="$(read_secret_prompt 'Confirmez le mot de passe : ')" \
+    || { log_err "Saisie de la confirmation interrompue - scellement annulé."; return 1; }
   if [ -z "$pw1" ]; then
     log_err "Mot de passe vide - scellement annulé."
     return 1
@@ -846,7 +879,7 @@ seal_read_password() {
 
 seal_encrypted() {
   local dir="$1" enc streamdir pw nb need avail biggest mode seal_log destdir vwhy
-local vrc=0
+  local vrc=0
   [ -d "$dir" ] || return 0
   nb="$(find "$dir" -type f 2>/dev/null | wc -l | tr -d ' ')"
   need="$(seal_needed_bytes "$dir")"; need="${need:-0}"
@@ -857,7 +890,6 @@ local vrc=0
   # Sans cette vérification, un SEAL_DEST supprimé du disque depuis la
   # config produisait un échec openssl obscur du type "Can't open ... for
   # writing" alors que la version claire était intacte.
-  local destdir vwhy vrc
   destdir="$(seal_dest_path "$dir" dir)"
   vwhy="$(seal_validate_dest "$destdir")" || vrc=$?
   if [ "$vrc" = 1 ]; then
@@ -944,10 +976,8 @@ archive supprimée : $enc"
     return 0
   fi
 
-# ---- Mode flux : chaque fichier est chiffré, VÉRIFIÉ, puis son clair est
-  # détruit immédiatement. Le pic d'espace additionnel se limite donc au plus
-  # gros fichier, pas à la taille totale. La vérification est faite avant le
-  # shred : aucune donnée n'est détruite sans avoir été relue et validée.
+  # ---- Mode flux : un fichier à la fois. Chaque fichier est chiffré, relu et
+  # vérifié AVANT que son clair ne soit détruit (pic = plus gros fichier seul).
   log_info "Chiffrement AES-256 en mode flux ($dir -> $streamdir)..."
   if [ -e "$streamdir" ] && [ -n "$(ls -A "$streamdir" 2>/dev/null)" ]; then
     # On ne détruit JAMAIS un dossier chiffré existant : il peut être le seul
@@ -999,11 +1029,8 @@ Le dossier chiffré est CONSERVÉ : $streamdir"
   done < <(find "$dir" -type f -print0 2>/dev/null)
   printf '\r%60s\r' '' >&2
 
-  # ÉCHEC APRÈS CHIFFREMENT : on NE SUPPRIME PAS $streamdir. Les fichiers
-  # déjà chiffrés + vérifiés ont eu leur clair shredé : c'est désormais la
-  # SEULE copie restante. Le rm -rf d'origine détruisait les preuves, et le
-  # message annonçait à tort « version claire conservée » alors que les
-  # fichiers précédents venaient d'être détruits.
+  # Échec en cours : $streamdir est CONSERVÉ. Les fichiers déjà chiffrés et
+  # vérifiés ont eu leur clair détruit : c'est la SEULE copie restante.
   if [ "$ok" -ne 1 ]; then
     [ -s "$seal_log" ] && { log_err "Détails :"; tail -n 5 "$seal_log" >&2; }
     if [ "$n" -gt 0 ]; then
@@ -1036,69 +1063,129 @@ Le dossier chiffré est CONSERVÉ : $streamdir"
 }
 
 # Décision analyste : déverrouille (chattr -i / chmod a-w) puis supprime les preuves.
-# $1 = chemin du dossier ; mot de passe requis si scellé par chiffrement.
+# $1 = chemin du dossier. La suppression locale d'une affaire ne demande aucun mot
+# de passe : la double confirmation explicite de cmd_purge suffit.
 # Gère les deux dispositions produites par seal_encrypted() :
 #   - archive unique  <dossier>.aes256.tar.gz
 #   - dossier chiffré <dossier>.aes256.d/ (mode flux, un fichier chiffré par fichier)
 unseal_and_delete() {
-  local dir="$1" pw streamdir enc
+  local dir="$1" streamdir enc
   streamdir="$(seal_dest_path "$dir" stream)"
   enc="$(seal_dest_path "$dir" archive)"
   # L'archive peut avoir été produite sur un autre FS (SEAL_DEST).
   [ -f "$dir.aes256.tar.gz" ] && enc="$dir.aes256.tar.gz"
 
+  if [ ! -e "$dir" ] && [ ! -e "$enc" ] && [ ! -d "$streamdir" ]; then
+    log_err "Dossier introuvable : $dir"
+    return 1
+  fi
+  if [ "$(id -u)" = 0 ] && command -v chattr >/dev/null 2>&1; then
+    chattr -R -i "$dir" "$streamdir" 2>/dev/null
+  fi
+  chmod -R u+w "$dir" "$streamdir" 2>/dev/null
+  rm -f "$enc" 2>/dev/null
+  rm -rf "$dir" "$streamdir" 2>/dev/null
+  custody_log "Preuves supprimées (décision analyste) : $dir"
+  log_ok "Preuves supprimées : $dir"
+}
+
+# ------------------------------------------------------------------
+# Consultation d'une affaire scellée (lecture seule, vers un temp).
+# ------------------------------------------------------------------
+
+# Énumère les affaires : evidence/ ET SEAL_DEST (archive unique, mode flux ou
+# dossier clair). Sort "base<TAB>état" ; état ∈ {archive,flux,clair,verrouillé}.
+# "base" est le chemin sans suffixe .aes256.* (dossier d'affaire attendu).
+sealed_cases() {
+  local d base state f seen=""
+  local dirs=("$EVIDENCE_DIR")
+  [ -n "${SEAL_DEST:-}" ] && dirs+=("$(seal_expand_tilde "$SEAL_DEST")")
+  for d in "${dirs[@]}"; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*.aes256.tar.gz; do
+      [ -f "$f" ] || continue
+      base="${f%.aes256.tar.gz}"
+      case "$seen" in *"|$base|"*) continue ;; esac
+      seen="$seen|$base|"
+      printf '%s\tarchive\n' "$base"
+    done
+    for f in "$d"/*.aes256.d; do
+      [ -d "$f" ] || continue
+      base="${f%.aes256.d}"
+      case "$seen" in *"|$base|"*) continue ;; esac
+      seen="$seen|$base|"
+      printf '%s\tflux\n' "$base"
+    done
+    for f in "$d"/CASE-*; do
+      [ -d "$f" ] || continue
+      case "$f" in *.aes256.d) continue ;; esac
+      base="$f"
+      case "$seen" in *"|$base|"*) continue ;; esac
+      seen="$seen|$base|"
+      state="clair"
+      if lsattr -d "$f" 2>/dev/null | grep -q '\bi\b'; then state="verrouillé"; fi
+      printf '%s\t%s\n' "$base" "$state"
+    done
+  done
+}
+
+# Déchiffre une affaire scellée vers un dossier de travail.
+#   $1 = base (chemin sans suffixe)   $2 = destination
+#   $3 = "report" (results/rapport.* uniquement) | "all" (tout)
+#   $4 = mot de passe
+# Le mot de passe passe par l'environnement (jamais dans argv). Renvoie 0 si
+# le déchiffrement a réussi, 1 sinon (mot de passe erroné ou archive illisible).
+unseal_extract() {
+  local base="$1" dest="$2" scope="${3:-all}" pw="$4"
+  local enc streamdir rel src dst want got f
+  mkdir -p "$dest" || return 1
+  enc="$(seal_dest_path "$base" archive)"
+  [ -f "$base.aes256.tar.gz" ] && enc="$base.aes256.tar.gz"
+  streamdir="$(seal_dest_path "$base" stream)"
+  [ -d "$base.aes256.d" ] && streamdir="$base.aes256.d"
+
   if [ -f "$enc" ]; then
-    if [ ! -t 0 ]; then
-      log_err "Suppression refusée : aucun terminal pour saisir le mot de passe de scellement."
-      return 1
+    # pipefail : sans lui, un échec de gzip/tar sur un mauvais mot de passe
+    # serait masqué par le statut d'openssl et l'extraction serait "réussie".
+    if [ "$scope" = "report" ]; then
+      ( set -o pipefail
+        MVT_SEAL_PW="$pw" openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -pass env:MVT_SEAL_PW -in "$enc" 2>/dev/null \
+        | gzip -dc 2>/dev/null \
+        | tar xf - -C "$dest" --strip-components=1 --wildcards \
+              '*/results/rapport.txt' '*/results/rapport.pdf' 2>/dev/null )
+    else
+      ( set -o pipefail
+        MVT_SEAL_PW="$pw" openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -pass env:MVT_SEAL_PW -in "$enc" 2>/dev/null \
+        | gzip -dc 2>/dev/null \
+        | tar xf - -C "$dest" --strip-components=1 2>/dev/null )
     fi
-    printf 'Mot de passe de scellement pour SUPPRIMER les preuves : ' >&2
-    IFS= read -r -s pw || { echo >&2; log_err "Saisie interrompue - suppression refusée."; return 1; }
-    echo >&2
-    # pipefail : un déchiffrement valide doit produire un tar lisible EN ENTIER.
-    if ! ( set -o pipefail
-           openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "pass:$pw" \
-             -in "$enc" 2>/dev/null \
-         | gzip -dc 2>/dev/null \
-         | tar tf - >/dev/null 2>&1 ); then
-      log_err "Mot de passe incorrect ou archive illisible - suppression refusée."
-      return 1
-    fi
-    rm -f "$enc" 2>/dev/null
-  elif [ -d "$streamdir" ]; then
-    # Mode flux : on vérifie le déchiffrement d'un échantillon face au manifeste.
-    if [ ! -t 0 ]; then
-      log_err "Suppression refusée : aucun terminal pour saisir le mot de passe de scellement."
-      return 1
-    fi
-    printf 'Mot de passe de scellement pour SUPPRIMER les preuves : ' >&2
-    IFS= read -r -s pw || { echo >&2; log_err "Saisie interrompue - suppression refusée."; return 1; }
-    echo >&2
-    local sample f rel want got bad=0
-    sample="$(find "$streamdir" -type f ! -name 'MANIFESTE.seal' 2>/dev/null | head -3)"
+    return $?
+  fi
+
+  if [ -d "$streamdir" ]; then
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       rel="${f#"$streamdir"/}"
+      if [ "$scope" = "report" ]; then
+        case "$rel" in results/rapport.txt|results/rapport.pdf) ;; *) continue ;; esac
+      fi
+      src="$f"
+      dst="$dest/$rel"
+      mkdir -p "$(dirname "$dst")" || return 1
+      MVT_SEAL_PW="$pw" openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+          -pass env:MVT_SEAL_PW -in "$src" -out "$dst" 2>/dev/null || return 1
       want="$(awk -v k="./$rel" '$2 == k {print $1}' "$streamdir/MANIFESTE.seal" 2>/dev/null | head -1)"
-      got="$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "pass:$pw" \
-              -in "$f" 2>/dev/null | sha256sum | awk '{print $1}')"
-      [ -n "$want" ] && [ "$got" = "$want" ] || { bad=1; break; }
-    done <<< "$sample"
-    if [ "$bad" -eq 1 ]; then
-      log_err "Mot de passe incorrect ou dossier chiffré illisible - suppression refusée."
-      return 1
-    fi
-    rm -rf "$streamdir" 2>/dev/null
-  else
-    [ -d "$dir" ] || { log_err "Dossier introuvable : $dir"; return 1; }
-    if [ "$(id -u)" = 0 ] && command -v chattr >/dev/null 2>&1; then
-      chattr -R -i "$dir" 2>/dev/null
-    fi
-    chmod -R u+w "$dir" 2>/dev/null
+      if [ -n "$want" ]; then
+        got="$(sha256sum "$dst" 2>/dev/null | awk '{print $1}')"
+        [ "$got" = "$want" ] || return 1
+      fi
+    done < <(find "$streamdir" -type f ! -name 'MANIFESTE.seal' 2>/dev/null)
+    return 0
   fi
-  rm -rf "$dir" 2>/dev/null
-  custody_log "Preuves supprimées (décision analyste) : $dir"
-  log_ok "Preuves supprimées : $dir"
+
+  return 1
 }
 
 # ------------------------------------------------------------------
@@ -1166,14 +1253,19 @@ valid_json() {
   python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$1" 2>/dev/null
 }
 
+# Fichiers IoCs (.stix2/.json) d'un dossier, dépôts git et état exclus.
+_ioc_find_in() {
+  find "$1" \( -path '*/.git' -o -path '*/.state' \) -prune -o \
+      -type f \( -name '*.stix2' -o -name '*.json' \) -print 2>/dev/null \
+    | LC_ALL=C sort -u
+}
+
 # ------------------------------------------------------------------
 # IoCs : liste des fichiers STIX2 disponibles et construction de MVT_STIX2
 # ------------------------------------------------------------------
 find_ioc_files() {
-  find "$IOCS_CUSTOM_DIR" "$IOCS_MANAGED_DIR" \
-      \( -path '*/.git' -o -path '*/.state' \) -prune -o \
-      -type f \( -name '*.stix2' -o -name '*.json' \) -print 2>/dev/null \
-    | LC_ALL=C sort -u
+  _ioc_find_in "$IOCS_CUSTOM_DIR"
+  _ioc_find_in "$IOCS_MANAGED_DIR"
 }
 
 # Retourne la liste des fichiers IoCs séparés par ':' (format MVT_STIX2).
@@ -1364,389 +1456,36 @@ module_desc() {
 }
 
 # ------------------------------------------------------------------
-# Infos device (modèle, version, ...) depuis les fichiers d'une analyse
+# Infos device (modèle, version, ...) — parseur unique : lib/deviceinfo.py
 # ------------------------------------------------------------------
-device_info_from() {
-  local dir="$1"
-  PYTHONPATH="$WRAPPER_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" python3 - "$dir" <<'PY'
-import json, os, re, sys
-from jsonutils import search
-root = sys.argv[1]
-parts = []
-for name in ("backup_info.json", "sysdiagnose_info.json"):
-    p = os.path.join(root, name)
-    if os.path.isfile(p):
-        try:
-            d = json.load(open(p, encoding="utf-8"))
-            model  = search(d, ("product_type", "product", "devicemodel", "model"))
-            ver    = search(d, ("product_version", "ios_version", "version"))
-            dname  = search(d, ("device_name", "name"))
-            imei   = search(d, ("imei",))
-            serial = search(d, ("serial_number", "serialNumber", "SerialNumber"))
-            if dname: parts.append(f"Nom: {dname}")
-            if model: parts.append(f"Modèle: {model}")
-            if ver:   parts.append(f"OS: {ver}")
-            if imei:  parts.append(f"IMEI: {imei}")
-            if serial: parts.append(f"Serial: {serial}")
-        except Exception:
-            pass
-        if parts:
-            break
-if not parts:
-    p = os.path.join(root, "Info.plist")
-    if os.path.isfile(p):
-        try:
-            import base64, plistlib
-            def maybe_b64(v):
-                if not isinstance(v, str):
-                    return v
-                s = v.strip()
-                if not s or len(s) % 4:
-                    return v
-                try:
-                    raw = base64.b64decode(s, validate=True)
-                    text = raw.decode("utf-8", "strict")
-                except Exception:
-                    return v
-                if (text.isprintable()
-                        and base64.b64encode(raw).decode("ascii").rstrip("=") == s.rstrip("=")):
-                    return text
-                return v
-            with open(p, "rb") as fh:
-                d = plistlib.load(fh)
-            for k, l in (("Device Name", "Nom"), ("Product Type", "Modèle"),
-                         ("Product Version", "OS"), ("IMEI", "IMEI"),
-                         ("Serial Number", "Serial"), ("Unique Device ID", "UDID")):
-                v = maybe_b64(d.get(k))
-                if v not in (None, "", "unavailable"):
-                    parts.append(f"{l}: {v}")
-        except Exception:
-            pass
-if not parts:
-    p = os.path.join(root, "acquisition.json")
-    if os.path.isfile(p):
-        try:
-            d = json.load(open(p, encoding="utf-8"))
-            model  = search(d, ("product_model", "model", "device_model"))
-            ver    = search(d, ("device_version", "android_version", "version", "os_version"))
-            manuf  = search(d, ("product_manufacturer", "manufacturer", "brand"))
-            imei   = search(d, ("imei", "imei1", "Imei"))
-            serial = search(d, ("serial_number", "serial", "Serial"))
-            if not serial:
-                adb = search(d, ("collector", "Adb"))
-                if isinstance(adb, dict):
-                    serial = adb.get("Serial")
-            if model:  parts.append(f"Modèle: {model}")
-            if ver:    parts.append(f"OS: {ver}")
-            if manuf:  parts.append(f"Constructeur: {manuf}")
-            if imei:   parts.append(f"IMEI: {imei}")
-            if serial: parts.append(f"Serial: {serial}")
-        except Exception:
-            pass
-if not parts:
-    p = os.path.join(root, "getprop.txt")
-    if os.path.isfile(p):
-        try:
-            txt = open(p, encoding="utf-8", errors="ignore").read()
-            for key, label in (("ro.product.model","Modèle"),
-                               ("ro.build.version.release","OS"),
-                               ("ro.product.manufacturer","Constructeur"),
-                               ("ro.ril.oem.imei","IMEI"),
-                               ("ro.serialno","Serial")):
-                m = re.search(r'\[(' + re.escape(key) + r')\]:\s*\[([^\]]*)\]', txt)
-                if m and m.group(2):
-                    parts.append(f"{label}: {m.group(2)}")
-        except Exception:
-            pass
-print(" ; ".join(parts))
-PY
-}
-
-# ------------------------------------------------------------------
-# Infos device structurées pour le rapport juridique
-# Retourne des lignes clé:valeur pour le rapport.
-# $1 = dossier d'analyse (results ou case_dir)
-# $2.. = paires clé=valeur surchargées (ex: IMEI=xxx Serial=yyy)
-# ------------------------------------------------------------------
+# Lignes structurées "champ: valeur" pour le rapport juridique.
+#   $1 = dossier d'analyse   $2.. = paires Cle=Valeur surchargées
 extract_device_details() {
-  local dir="$1"; shift
-  local extra_args=("$@")
-  PYTHONPATH="$WRAPPER_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" python3 - "$dir" "${extra_args[@]}" <<'PY'
-import base64, json, os, plistlib, re, sys
-from jsonutils import search
-root = sys.argv[1]
-overrides = {}
-for a in sys.argv[2:]:
-    if "=" in a:
-        k, v = a.split("=", 1)
-        overrides[k] = v
-
-def fmt_storage(val):
-    if val is None:
-        return None
-    try:
-        n = int(str(val).split()[0])
-        if n > 1_000_000_000_000:
-            return f"{n / 1_000_000_000_000:.0f} To"
-        if n > 1_000_000_000:
-            return f"{n / 1_000_000_000:.0f} Go"
-        if n > 1_000_000:
-            return f"{n / 1_000_000:.0f} Mo"
-        return str(n)
-    except (ValueError, TypeError, IndexError):
-        return str(val)[:40]
-
-def b64name(v):
-    try:
-        s = base64.b64decode(v).decode("utf-8", "ignore")
-        return s if s.isprintable() else None
-    except Exception:
-        return None
-
-APPLE_MODELS = {
-    "iPhone1,1": "iPhone (1re)", "iPhone1,2": "iPhone 3G", "iPhone2,1": "iPhone 3GS",
-    "iPhone3,1": "iPhone 4", "iPhone3,3": "iPhone 4 (CDMA)",
-    "iPhone4,1": "iPhone 4s", "iPhone5,1": "iPhone 5", "iPhone5,2": "iPhone 5",
-    "iPhone5,3": "iPhone 5c", "iPhone5,4": "iPhone 5c",
-    "iPhone6,1": "iPhone 5s", "iPhone6,2": "iPhone 5s",
-    "iPhone7,1": "iPhone 6 Plus", "iPhone7,2": "iPhone 6",
-    "iPhone8,1": "iPhone 6s", "iPhone8,2": "iPhone 6s Plus", "iPhone8,4": "iPhone SE (1re gen.)",
-    "iPhone9,1": "iPhone 7", "iPhone9,2": "iPhone 7 Plus",
-    "iPhone9,3": "iPhone 7", "iPhone9,4": "iPhone 7 Plus",
-    "iPhone10,1": "iPhone 8", "iPhone10,2": "iPhone 8 Plus", "iPhone10,3": "iPhone X",
-    "iPhone10,4": "iPhone 8", "iPhone10,5": "iPhone 8 Plus", "iPhone10,6": "iPhone X",
-    "iPhone11,2": "iPhone XS", "iPhone11,4": "iPhone XS Max",
-    "iPhone11,6": "iPhone XS Max", "iPhone11,8": "iPhone XR",
-    "iPhone12,1": "iPhone 11", "iPhone12,3": "iPhone 11 Pro", "iPhone12,5": "iPhone 11 Pro Max",
-    "iPhone13,1": "iPhone 12 mini", "iPhone13,2": "iPhone 12",
-    "iPhone13,3": "iPhone 12 Pro", "iPhone13,4": "iPhone 12 Pro Max",
-    "iPhone14,2": "iPhone 13 Pro", "iPhone14,3": "iPhone 13 Pro Max",
-    "iPhone14,4": "iPhone 13 mini", "iPhone14,5": "iPhone 13",
-    "iPhone14,7": "iPhone 14", "iPhone14,8": "iPhone 14 Plus",
-    "iPhone15,2": "iPhone 14 Pro", "iPhone15,3": "iPhone 14 Pro Max",
-    "iPhone15,4": "iPhone 15", "iPhone15,5": "iPhone 15 Plus",
-    "iPhone16,1": "iPhone 15 Pro", "iPhone16,2": "iPhone 15 Pro Max",
-    "iPhone17,1": "iPhone 16 Pro", "iPhone17,2": "iPhone 16 Pro Max",
-    "iPhone17,3": "iPhone 16", "iPhone17,4": "iPhone 16 Plus", "iPhone17,5": "iPhone 16e",
-    "iPad1,1": "iPad", "iPad2,5": "iPad mini", "iPad2,7": "iPad mini",
-    "iPad4,1": "iPad Air", "iPad4,4": "iPad mini 2", "iPad4,7": "iPad mini 3",
-    "iPad5,1": "iPad mini 4", "iPad5,2": "iPad mini 4",
-    "iPad5,3": "iPad Air 2", "iPad5,4": "iPad Air 2",
-    "iPad6,7": "iPad Pro (12,9\")", "iPad6,8": "iPad Pro (12,9\")",
-    "iPad6,11": "iPad (5e gen.)", "iPad6,12": "iPad (5e gen.)",
-    "iPad7,1": "iPad Pro (12,9\")", "iPad7,2": "iPad Pro (12,9\")",
-    "iPad7,5": "iPad (6e gen.)", "iPad7,6": "iPad (6e gen.)",
-    "iPad11,1": "iPad mini (5e gen.)", "iPad11,2": "iPad mini (5e gen.)",
-    "iPad11,6": "iPad (8e gen.)", "iPad11,7": "iPad (8e gen.)",
-    "iPad13,1": "iPad Air (4e gen.)", "iPad13,2": "iPad Air (4e gen.)",
-    "iPad13,16": "iPad Air (5e gen.)", "iPad13,17": "iPad Air (5e gen.)",
-    "iPad14,1": "iPad mini (6e gen.)", "iPad14,2": "iPad mini (6e gen.)",
-    "iPod5,1": "iPod touch (5e gen.)", "iPod7,1": "iPod touch (6e gen.)",
-    "iPod9,1": "iPod touch (7e gen.)",
-}
-SAMSUNG_MODELS = {
-    "SM-J710F": "Galaxy J7 (2016)", "SM-J710FN": "Galaxy J7 (2016)", "SM-J710MN": "Galaxy J7 (2016)",
-    "SM-J730F": "Galaxy J7 (2017)", "SM-J530F": "Galaxy J5 (2017)", "SM-J600F": "Galaxy J6",
-    "SM-A515F": "Galaxy A51", "SM-A525F": "Galaxy A52", "SM-A325F": "Galaxy A32",
-    "SM-A217F": "Galaxy A21s", "SM-A217M": "Galaxy A21s",
-    "SM-G950F": "Galaxy S8", "SM-G955F": "Galaxy S8+",
-    "SM-G960F": "Galaxy S9", "SM-G965F": "Galaxy S9+",
-    "SM-G970F": "Galaxy S10e", "SM-G973F": "Galaxy S10", "SM-G975F": "Galaxy S10+",
-    "SM-G975U": "Galaxy S10+", "SM-G970U": "Galaxy S10e",
-    "SM-G991B": "Galaxy S21", "SM-G996B": "Galaxy S21+", "SM-G998B": "Galaxy S21 Ultra",
-    "SM-S901B": "Galaxy S22", "SM-S906B": "Galaxy S22+", "SM-S908B": "Galaxy S22 Ultra",
-    "SM-S911B": "Galaxy S23", "SM-S916B": "Galaxy S23 Ultra",
-    "SM-N975F": "Galaxy Note 10+", "SM-N970F": "Galaxy Note 10",
-    "SM-T510": "Galaxy Tab A (10.1)", "SM-T515": "Galaxy Tab A (10.1)",
+  local k v
+  while IFS=$'\t' read -r k v; do
+    [ -n "$k" ] && printf '%s: %s\n' "$k" "$v"
+  done < <(_device_tsv "$@" 2>/dev/null)
 }
 
-def human_model(code, brand):
-    if not code:
-        return None
-    c = str(code).split("/")[0].strip()
-    if c in APPLE_MODELS:
-        return APPLE_MODELS[c]
-    if c in SAMSUNG_MODELS:
-        return SAMSUNG_MODELS[c]
-    if c.upper().startswith("SM-"):
-        return "Galaxy " + c[3:]
-    return None
+# Résumé sur une ligne (nom, modèle, OS, IMEI, série) pour la console.
+device_info_from() {
+  local k v out=""
+  while IFS=$'\t' read -r k v; do
+    case "$k" in
+      "Nom de l'appareil")      out="${out}${out:+ ; }Nom: $v" ;;
+      "Modele")                 out="${out}${out:+ ; }Modèle: $v" ;;
+      "Systeme d exploitation") out="${out}${out:+ ; }OS: $v" ;;
+      "IMEI")                   out="${out}${out:+ ; }IMEI: $v" ;;
+      "Numero de serie")        out="${out}${out:+ ; }Serial: $v" ;;
+    esac
+  done < <(_device_tsv "$@" 2>/dev/null)
+  printf '%s' "$out"
+}
 
-# ordre d'affichage dans le rapport
-ORDER = ["Nom de l'appareil", "Marque", "Modele", "Systeme d exploitation",
-         "Build", "Dernier patch de securite", "Numero de telephone", "IMEI",
-         "Numero de serie", "ICCID", "MEID", "Target identifier",
-         "Derniere sauvegarde", "Applications installees", "Capacite stockage"]
-
-result = {k: (overrides.get({
-    "Nom de l'appareil": "DeviceName", "Marque": "Brand", "Modele": "Model",
-    "Systeme d exploitation": "OS", "Build": "Build", "IMEI": "IMEI",
-    "Numero de serie": "Serial", "Capacite stockage": "Storage",
-    "Numero de telephone": "Phone",
-}.get(k, "")) or None) for k in ORDER}
-
-model_code = overrides.get("ModelCode") or None
-platform = overrides.get("Platform")
-
-# --- Source iOS : plists d'une backup iTunes (Info.plist / Manifest.plist) ---
-for name in ("Info.plist", "Manifest.plist"):
-    pp = os.path.join(root, name)
-    if not os.path.isfile(pp):
-        continue
-    try:
-        with open(pp, "rb") as fh:
-            d = plistlib.load(fh)
-    except Exception:
-        continue
-    if name == "Info.plist":
-        platform = platform or "iOS"
-        model_code = model_code or d.get("Product Type") or d.get("ProductType") or d.get("Device Model")
-        ver = d.get("Product Version") or d.get("ProductVersion") or d.get("iOS Version")
-        build = d.get("Build Version") or d.get("BuildVersion")
-        if ver:
-            result["Systeme d exploitation"] = result["Systeme d exploitation"] or ("iOS " + str(ver))
-        result["Build"] = result["Build"] or build
-        result["Nom de l'appareil"] = result["Nom de l'appareil"] or \
-            d.get("Device Name") or d.get("DeviceName")
-        result["Numero de telephone"] = result["Numero de telephone"] or \
-            d.get("Phone Number") or d.get("PhoneNumber")
-        result["IMEI"] = result["IMEI"] or d.get("IMEI")
-        result["Numero de serie"] = result["Numero de serie"] or \
-            d.get("Serial Number") or d.get("SerialNumber")
-        result["ICCID"] = result["ICCID"] or d.get("ICCID")
-        result["MEID"] = result["MEID"] or d.get("MEID")
-        result["Target identifier"] = result["Target identifier"] or \
-            d.get("Unique Device ID") or d.get("UniqueDeviceID")
-        result["Derniere sauvegarde"] = result["Derniere sauvegarde"] or \
-            d.get("Last Backup Date") or d.get("LastBackupDate")
-        result["Marque"] = result["Marque"] or "Apple"
-    elif name == "Manifest.plist":
-        result["Derniere sauvegarde"] = result["Derniere sauvegarde"] or \
-            d.get("Date") or d.get("LastBackupDate")
-
-# --- Sources iOS (clés PascalCase) ---
-for name in ("backup_info.json", "sysdiagnose_info.json"):
-    p = os.path.join(root, name)
-    if not os.path.isfile(p):
-        continue
-    try:
-        d = json.load(open(p, encoding="utf-8"))
-    except Exception:
-        continue
-    platform = "iOS"
-    model_code = model_code or search(d, ("Product Type", "product_type", "ProductType", "model"))
-    ver = search(d, ("Product Version", "product_version", "ProductVersion", "ios_version"))
-    build = search(d, ("Build Version", "build_version", "BuildVersion"))
-    if ver:
-        result["Systeme d exploitation"] = result["Systeme d exploitation"] or ("iOS " + str(ver))
-    result["Build"] = result["Build"] or build
-    result["Nom de l'appareil"] = result["Nom de l'appareil"] or \
-        b64name(search(d, ("Display Name",)) or "") or search(d, ("Device Name", "device_name", "name", "Devicename"))
-    result["Numero de telephone"] = result["Numero de telephone"] or \
-        search(d, ("Phone Number", "phone_number", "PhoneNumber"))
-    result["IMEI"] = result["IMEI"] or search(d, ("IMEI", "imei"))
-    result["Numero de serie"] = result["Numero de serie"] or \
-        search(d, ("Serial Number", "serial_number", "SerialNumber", "Serial"))
-    result["ICCID"] = result["ICCID"] or search(d, ("ICCID", "iccid"))
-    result["MEID"] = result["MEID"] or search(d, ("MEID", "meid"))
-    result["Target identifier"] = result["Target identifier"] or \
-        search(d, ("Target Identifier", "target_identifier", "Unique Identifier", "unique_identifier"))
-    result["Derniere sauvegarde"] = result["Derniere sauvegarde"] or \
-        search(d, ("Last Backup Date", "last_backup_date", "LastBackupDate"))
-    apps = search(d, ("Installed Applications", "installed_applications"))
-    if isinstance(apps, list) and apps:
-        result["Applications installees"] = result["Applications installees"] or f"{len(apps)} application(s)"
-    result["Marque"] = result["Marque"] or "Apple"
-    break
-
-# --- Source Android : acquisition.json ---
-if platform != "iOS":
-    p = os.path.join(root, "acquisition.json")
-    if os.path.isfile(p):
-        try:
-            d = json.load(open(p, encoding="utf-8"))
-        except Exception:
-            d = {}
-        platform = "Android"
-        model_code = model_code or search(d, ("product_model", "model", "device_model"))
-        ver = search(d, ("device_version", "android_version", "version", "os_version"))
-        if ver:
-            result["Systeme d exploitation"] = result["Systeme d exploitation"] or ("Android " + str(ver))
-        result["Marque"] = result["Marque"] or \
-            search(d, ("product_manufacturer", "manufacturer", "brand"))
-        result["IMEI"] = result["IMEI"] or search(d, ("imei", "imei1", "Imei"))
-        serial = result["Numero de serie"] or search(d, ("serial_number", "serial", "Serial"))
-        if not serial:
-            adb = search(d, ("collector", "Adb"))
-            if isinstance(adb, dict):
-                serial = adb.get("Serial")
-        result["Numero de serie"] = result["Numero de serie"] or serial
-
-# --- Source Android : getprop.txt ---
-p = os.path.join(root, "getprop.txt")
-if os.path.isfile(p):
-    try:
-        txt = open(p, encoding="utf-8", errors="ignore").read()
-        gmap = {
-            "ro.product.model": "Modele",
-            "ro.product.manufacturer": "Marque",
-            "ro.build.version.short": "Build",
-            "ro.build.version.incremental": "Build",
-            "ro.build.display.id": "Build",
-            "ro.build.version.security_patch": "Dernier patch de securite",
-            "ro.ril.oem.imei": "IMEI",
-            "ro.serialno": "Numero de serie",
-        }
-        release = None
-        mrel = re.search(r'\[ro\.build\.version\.release\]:\s*\[([^\]]*)\]', txt)
-        if mrel:
-            release = mrel.group(1)
-        if release:
-            result["Systeme d exploitation"] = result["Systeme d exploitation"] or ("Android " + release)
-        for key, field in gmap.items():
-            if result[field]:
-                continue
-            m = re.search(r'\[' + re.escape(key) + r'\]:\s*\[([^\]]*)\]', txt)
-            if m and m.group(1):
-                result[field] = m.group(1)
-        if not result["Capacite stockage"]:
-            for key in ("ro.product.disk.size", "ro.emmc.size"):
-                m = re.search(r'\[' + re.escape(key) + r'\]:\s*\[([^\]]*)\]', txt)
-                if m and m.group(1):
-                    result["Capacite stockage"] = fmt_storage(m.group(1))
-                    break
-    except Exception:
-        pass
-
-# --- Compteur d'applications Android ---
-if not result["Applications installees"]:
-    for name in ("aqf_packages.json", "dumpsys_packages.json"):
-        ap = os.path.join(root, name)
-        if os.path.isfile(ap):
-            try:
-                alist = json.load(open(ap, encoding="utf-8"))
-                if isinstance(alist, list):
-                    n = len([x for x in alist if isinstance(x, dict) and x.get("name")])
-                    if n:
-                        result["Applications installees"] = f"{n} application(s)"
-                        break
-            except Exception:
-                pass
-
-# --- Modele humain + codé ---
-if not result["Modele"] and model_code:
-    human = human_model(model_code, result["Marque"])
-    result["Modele"] = f"{human} ({model_code})" if human else str(model_code)
-elif result["Modele"]:
-    human = human_model(result["Modele"], result["Marque"])
-    if human and human != str(result["Modele"]):
-        result["Modele"] = f"{human} ({result['Modele']})"
-
-for field in ORDER:
-    val = result[field]
-    if val not in (None, "", "non disponible"):
-        print(f"{field}: {str(val)[:170]}")
-PY
+# Appel du parseur commun (renvoie des lignes "champ<TAB>valeur").
+_device_tsv() {
+  PYTHONPATH="$WRAPPER_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 "$WRAPPER_DIR/lib/deviceinfo.py" "$@"
 }
 
 # ------------------------------------------------------------------
@@ -1861,71 +1600,16 @@ except Exception:
 PY
 }
 
-# Convertit un rapport texte (rapport.txt) en PDF, 100 % python stdlib
-# (aucune dépendance : pas de LibreOffice/pandoc/reportlab). Police base-14
-# Courier /WinAnsiEncoding : les glyphes hors CP1252 (═, ↑, …) sont
-# translittérés en ASCII équivalents.
+# Convertit un rapport texte (rapport.txt) en PDF structuré, 100 % python
+# stdlib (moteur dans lib/report_pdf.py : titres, tableaux, pastilles de
+# sévérité, verdict, pagination). Aucune dépendance externe.
 rapport_to_pdf() {
   local txt="${1:-}" pdf="${2:-}"
   [ -f "$txt" ] || return 1
   [ -n "$pdf" ] || return 1
   command -v python3 >/dev/null 2>&1 || { log_err "python3 requis pour le PDF du rapport."; return 1; }
-  python3 - "$txt" "$pdf" <<'PDFPY' || { log_err "Échec de la génération PDF du rapport."; return 1; }
-import sys
-txt, pdf = sys.argv[1], sys.argv[2]
-text = open(txt, encoding="utf-8").read()
-trans = str.maketrans({
-    "═": "=", "─": "-", "│": "|", "┌": "+", "┐": "+", "└": "+", "┘": "+",
-    "├": "+", "┤": "+", "┬": "+", "┴": "+", "┼": "+",
-    "↑": "^", "↓": "v", "≥": ">=", "✔": "+", "•": "*", "✓": "v",
-})
-text = text.translate(trans).encode("cp1252", "replace")
-
-W = 92          # largeur max utile (Courier 9pt, A4, marges 46pt)
-LPP = 64        # lignes de corps par page
-FONT = "/F1 9 Tf"
-WIDTH, HEIGHT = 595, 842
-LX, TOP = 46, 792
-
-def esc(b):
-    return b.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
-
-lines = []
-for raw in text.split(b"\n"):
-    lines.extend(raw[i:i + W] for i in range(0, len(raw) or 1, W))
-pages = [lines[i:i + LPP] for i in range(0, len(lines), LPP)] or [[]]
-
-def content(page, num):
-    out = bytearray(b"BT\n" + FONT.encode() + b"\n1 0 0 1 %d %d Tm\n" % (LX, TOP))
-    for ln in page:
-        out += b"(" + esc(ln) + b") Tj\n0 -11 Td\n"
-    out += b"ET\n"
-    foot = b"Rapport d'analyse MVT-Wrapper - page %d/%d" % (num, len(pages))
-    out += b"BT\n/F1 8 Tf\n1 0 0 1 %d 40 Tm\n(%s) Tj\nET\n" % (LX, esc(foot))
-    return bytes(out)
-
-objs = [b"<< /Type /Catalog /Pages 2 0 R >>"]
-objs.append(b"<< /Type /Pages /Kids [" + b" ".join(b"%d 0 R" % (4 + 2 * i) for i in range(len(pages))) + b"] /Count %d >>" % len(pages))
-objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>")
-for i in range(len(pages)):
-    cont = 5 + 2 * i
-    objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] "
-                b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % (WIDTH, HEIGHT, cont))
-    c = content(pages[i], i + 1)
-    objs.append(b"<< /Length %d >>\nstream\n" % len(c) + c + b"endstream")
-
-out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-offsets = [0]
-for num, o in enumerate(objs, start=1):
-    offsets.append(len(out))
-    out += b"%d 0 obj\n" % num + o + b"\nendobj\n"
-xref = len(out)
-out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
-for off in offsets[1:]:
-    out += b"%010d 00000 n \n" % off
-out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
-open(pdf, "wb").write(out)
-PDFPY
+  python3 "$WRAPPER_DIR/lib/report_pdf.py" "$txt" "$pdf" \
+    || { log_err "Échec de la génération PDF du rapport."; return 1; }
   [ -s "$pdf" ] || { log_err "PDF du rapport vide : $pdf"; return 1; }
   return 0
 }
@@ -1988,71 +1672,61 @@ make_report() {
     echo "IoCs utilisés    : (aucun; IoCs officiels MVT éventuels)"
   fi
   echo ''
-  echo '--------------------------------------------------------------'
-  echo '  MENACES / INDICATEURS DE COMPROMISSION DETECTES'
-  echo '--------------------------------------------------------------'
-  echo '  Niveau de confiance : les détections sont classées par sévérité :'
-  echo '  [CRITICAL/HIGH] = signal fort à investiguer en priorité.'
-  echo '  [SPYWARE AVERE] = indique un rapprochement avec des collections dédiées au logiciel espion.'
-  echo '  [USAGE DOUBLE LEGITIME A CORROBORER] = signale des applications ou services ayant aussi une utilisation licite (système, télémaintenance, accessibilité...).'
-  echo '  Toute détection doit être corroborée.'
-  echo ''
   detection_synthesis "$results"
   echo ''
-    if [ "${#det[@]}" -eq 0 ]; then
-      echo "  [INFO] Aucune menace correspondant aux IoCs n'a été détectée."
-    else
-      echo "  ${#det[@]} fichier(s) de détection :"
+  if [ "${#det[@]}" -eq 0 ]; then
+    echo "  [INFO] Aucune menace correspondant aux IoCs n'a été détectée."
+  else
+    echo "  ${#det[@]} fichier(s) de détection :"
+    echo ''
+    for f in "${det[@]}"; do
+      mod="$(basename "$f")"; mod="${mod%_detected.json}"
+      desc="$(module_desc "$mod")"
+      printf '[%s]\n' "$mod"
+      [ -n "$desc" ] && printf '  * %s\n' "$desc"
+      json_summary "$f"
       echo ''
-      for f in "${det[@]}"; do
-        mod="$(basename "$f")"; mod="${mod%_detected.json}"
-        desc="$(module_desc "$mod")"
-        printf '[%s]\n' "$mod"
-        [ -n "$desc" ] && printf '  * %s\n' "$desc"
-        json_summary "$f"
-        echo ''
-      done
+    done
+  fi
+  echo ''
+  echo '--------------------------------------------------------------'
+  echo '  MODULES EXECUTES'
+  echo '--------------------------------------------------------------'
+  mapfile -t files < <(find "$results" -maxdepth 1 -type f \( -name '*.json' -o -name '*.csv' \) ! -name '*_detected.json' 2>/dev/null | LC_ALL=C sort | sed "s|$results/||")
+  if [ "${#files[@]}" -gt 0 ]; then
+    printf '  %s\n' "${files[@]}"
+  else
+    echo '  (aucun fichier JSON produit)'
+  fi
+  echo ''
+  echo '--------------------------------------------------------------'
+  echo '  PREUVES ET CHAINE DE TRAÇABILITE'
+  echo '--------------------------------------------------------------'
+  if [ -n "$evidence_dir" ] && [ -d "$evidence_dir" ]; then
+    echo "  Dossier de preuve : $evidence_rel"
+    if [ -f "$evidence_dir/SHA256SUMS-acquisition.txt" ]; then
+      echo "  Manifeste acquisition : $evidence_rel/SHA256SUMS-acquisition.txt"
+      echo "  Empreinte (SHA256) acquisition : $(sha256sum "$evidence_dir/SHA256SUMS-acquisition.txt" 2>/dev/null | awk '{print $1}')"
     fi
-    echo ''
-    echo '--------------------------------------------------------------'
-    echo '  MODULES EXECUTES'
-    echo '--------------------------------------------------------------'
-    mapfile -t files < <(find "$results" -maxdepth 1 -type f \( -name '*.json' -o -name '*.csv' \) ! -name '*_detected.json' 2>/dev/null | LC_ALL=C sort | sed "s|$results/||")
-    if [ "${#files[@]}" -gt 0 ]; then
-      printf '  %s\n' "${files[@]}"
-    else
-      echo '  (aucun fichier JSON produit)'
-    fi
-    echo ''
-    echo '--------------------------------------------------------------'
-    echo '  PREUVES ET CHAINE DE TRAÇABILITE'
-    echo '--------------------------------------------------------------'
-    if [ -n "$evidence_dir" ] && [ -d "$evidence_dir" ]; then
-      echo "  Dossier de preuve : $evidence_rel"
-      if [ -f "$evidence_dir/SHA256SUMS-acquisition.txt" ]; then
-        echo "  Manifeste acquisition : $evidence_rel/SHA256SUMS-acquisition.txt"
-        echo "  Empreinte (SHA256) acquisition : $(sha256sum "$evidence_dir/SHA256SUMS-acquisition.txt" 2>/dev/null | awk '{print $1}')"
+    if [ -f "$evidence_dir/SHA256SUMS.txt" ]; then
+      if ( cd "$evidence_dir" && sha256sum -c SHA256SUMS.txt >/dev/null 2>&1 ); then
+        echo '  Intégrité finale (SHA256) : Vérifiée - OK'
+      else
+        echo '  Intégrité finale (SHA256) : À CONTRÔLER (anomalie detectée !)'
       fi
-      if [ -f "$evidence_dir/SHA256SUMS.txt" ]; then
-        if ( cd "$evidence_dir" && sha256sum -c SHA256SUMS.txt >/dev/null 2>&1 ); then
-          echo '  Intégrité finale (SHA256) : verifiée - OK'
-        else
-          echo '  Intégrité finale (SHA256) : À CONTRÔLER (anomalie detectée !)'
-        fi
-        echo "  Empreinte (SHA256) manifeste final : $(sha256sum "$evidence_dir/SHA256SUMS.txt" 2>/dev/null | awk '{print $1}')"
-        echo "  Manifeste horodaté : $(head -n 1 "$evidence_dir/SHA256SUMS.txt" 2>/dev/null)"
-      fi
-      [ -f "$evidence_dir/chain_of_custody.txt" ] && echo "  Journal de traçabilité : $evidence_rel/chain_of_custody.txt — ${ANALYST:-$(whoami)} / ${STRUCTURE_NAME:-non renseignée}"
-    else
-      echo '  n/a'
+      echo "  Empreinte (SHA256) manifeste final : $(sha256sum "$evidence_dir/SHA256SUMS.txt" 2>/dev/null | awk '{print $1}')"
+      echo "  Manifeste horodaté : $(head -n 1 "$evidence_dir/SHA256SUMS.txt" 2>/dev/null)"
     fi
-    echo ''
-    echo "  Note : une détection d'IoC ne signifie pas automatiquement que le dispositif est compromis ; les IoCs publics seuls ne suffisent pas à conclure."
-    echo '  Chaque détection doit être investiguée par un analyste.'
-    echo "  Preservation avant remediation : aucune action de remediation (dont la desinstallation d'un logiciel espion) n'engage la securite d'etre techniquement realisee sur ce terminal a ce stade."
-    echo '  Orientation : 3919 (violences au sein du couple), 116 006 (France Victimes), Cybermalveillance.gouv.fr, CNIL, et un constat par commissaire de justice peut être envisagé.'
-    echo ''
-    echo '══════════════════════════════════════════════════════════'
+    [ -f "$evidence_dir/chain_of_custody.txt" ] && echo "  Journal de traçabilité : $evidence_rel/chain_of_custody.txt — ${ANALYST:-$(whoami)} / ${STRUCTURE_NAME:-non renseignée}"
+  else
+    echo '  n/a'
+  fi
+  echo ''
+  echo "  Note : une détection d'IoC ne signifie pas automatiquement que le dispositif est compromis ; les IoCs publics seuls ne suffisent pas à conclure. Chaque détection doit être investiguée par un analyste."
+  echo "  Preservation avant remediation : aucune action de remediation (dont la desinstallation d'un logiciel espion) n'engage la securite d'etre techniquement realisee sur ce terminal a ce stade."
+  echo '  Orientation : 3919 (violences au sein du couple), 116 006 (France Victimes), Cybermalveillance.gouv.fr, CNIL, et un constat par commissaire de justice peut être envisagé.'
+  echo ''
+  echo '══════════════════════════════════════════════════════════'
   } > "$report"
   log_ok "Rapport généré : $report"
   if rapport_to_pdf "$report" "$results/rapport.pdf"; then
@@ -2073,26 +1747,5 @@ make_report() {
     done
   fi
   hline
-}
-
-# ------------------------------------------------------------------
-# Volet orientation et accompagnement
-orientation_accompagnement() {
-  local platform="$1"
-  log_info "Orientation et accompagnement proposés ($platform)."
-  echo ''
-  echo '--------------------------------------------------------------'
-  echo '  ORIENTATION ET ACCOMPAGNEMENT '
-  echo '--------------------------------------------------------------'
-  echo '  3919 : violences au sein du couple (info, écoute, orientation)'
-  echo '  116 006 : France Victimes - aide aux victimes (7j/7)'
-  echo '  Hubertine Auclert : centre Hubertine Auclert (Île-de-France)'
-  echo '  Cybermalveillance : Cybermalveillance.gouv.fr'
-  echo '  Commissaire de justice : constat opposable (préservation)'
-  echo '  Plainte : dépôt de plainte / main courante en brigade (3919)'
-  echo ''
-  echo '--------------------------------------------------------------'
-  custody_log "Accompagnement proposé ($platform) : 3919, 116 006, Centre Hubertine Auclert, CNIL, Cybermalveillance, Echap, commissaire de justice."
-  return 0
 }
 
